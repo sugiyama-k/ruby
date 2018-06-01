@@ -15,25 +15,13 @@ VALUE rb_keyword_error_new(const char *error, VALUE keys); /* class.c */
 static VALUE method_missing(VALUE obj, ID id, int argc, const VALUE *argv,
 			    enum method_missing_reason call_status);
 
-struct args_info {
-    /* basic args info */
-    VALUE *argv;
-    int argc;
-    const struct rb_call_info_kw_arg *kw_arg;
-
-    /* additional args info */
-    int rest_index;
-    VALUE *kw_argv;
-    VALUE rest;
-};
-
 enum arg_setup_type {
     arg_setup_method,
     arg_setup_block
 };
 
 static inline int
-args_argc(struct args_info *args)
+args_argc(struct rb_vm_args_info *args)
 {
     if (args->rest == Qfalse) {
 	return args->argc;
@@ -44,7 +32,7 @@ args_argc(struct args_info *args)
 }
 
 static inline void
-args_extend(struct args_info *args, const int min_argc)
+args_extend(struct rb_vm_args_info *args, const int min_argc)
 {
     int i;
 
@@ -63,7 +51,7 @@ args_extend(struct args_info *args, const int min_argc)
 }
 
 static inline void
-args_reduce(struct args_info *args, int over_argc)
+args_reduce(struct rb_vm_args_info *args, int over_argc)
 {
     if (args->rest) {
 	const long len = RARRAY_LEN(args->rest);
@@ -84,7 +72,7 @@ args_reduce(struct args_info *args, int over_argc)
 }
 
 static inline int
-args_check_block_arg0(struct args_info *args, rb_thread_t *th)
+args_check_block_arg0(struct rb_vm_args_info *args, rb_thread_t *th)
 {
     VALUE ary = Qnil;
 
@@ -109,7 +97,7 @@ args_check_block_arg0(struct args_info *args, rb_thread_t *th)
 }
 
 static inline void
-args_copy(struct args_info *args)
+args_copy(struct rb_vm_args_info *args)
 {
     if (args->rest != Qfalse) {
 	int argc = args->argc;
@@ -151,13 +139,13 @@ args_copy(struct args_info *args)
 }
 
 static inline const VALUE *
-args_rest_argv(struct args_info *args)
+args_rest_argv(struct rb_vm_args_info *args)
 {
     return RARRAY_CONST_PTR(args->rest) + args->rest_index;
 }
 
 static inline VALUE
-args_rest_array(struct args_info *args)
+args_rest_array(struct rb_vm_args_info *args)
 {
     VALUE ary;
 
@@ -189,7 +177,7 @@ keyword_hash_p(VALUE *kw_hash_ptr, VALUE *rest_hash_ptr, rb_thread_t *th)
 }
 
 static VALUE
-args_pop_keyword_hash(struct args_info *args, VALUE *kw_hash_ptr, rb_thread_t *th)
+args_pop_keyword_hash(struct rb_vm_args_info *args, VALUE *kw_hash_ptr, rb_thread_t *th)
 {
     VALUE rest_hash;
 
@@ -234,19 +222,18 @@ args_pop_keyword_hash(struct args_info *args, VALUE *kw_hash_ptr, rb_thread_t *t
 }
 
 static int
-args_kw_argv_to_hash(struct args_info *args)
+args_kw_argv_to_hash(struct rb_vm_args_info *args)
 {
     const struct rb_call_info_kw_arg *kw_arg = args->kw_arg;
     const VALUE *const passed_keywords = kw_arg->keywords;
     const int kw_len = kw_arg->keyword_len;
     VALUE h = rb_hash_new_with_size(kw_len);
     const int kw_start = args->argc - kw_len;
-    const VALUE * const kw_argv = args->argv + kw_start;
     int i;
 
     args->argc = kw_start + 1;
     for (i=0; i<kw_len; i++) {
-	rb_hash_aset(h, passed_keywords[i], kw_argv[i]);
+	rb_hash_aset(h, passed_keywords[i], args->argv[kw_start + i]);
     }
 
     args->argv[args->argc - 1] = h;
@@ -255,7 +242,7 @@ args_kw_argv_to_hash(struct args_info *args)
 }
 
 static void
-args_stored_kw_argv_to_hash(struct args_info *args)
+args_stored_kw_argv_to_hash(struct rb_vm_args_info *args)
 {
     int i;
     const struct rb_call_info_kw_arg *kw_arg = args->kw_arg;
@@ -278,7 +265,7 @@ args_stored_kw_argv_to_hash(struct args_info *args)
 }
 
 static inline void
-args_setup_lead_parameters(struct args_info *args, int argc, VALUE *locals)
+args_setup_lead_parameters(struct rb_vm_args_info *args, int argc, int locals_off)
 {
     if (args->argc >= argc) {
 	/* do noting */
@@ -288,6 +275,7 @@ args_setup_lead_parameters(struct args_info *args, int argc, VALUE *locals)
     else {
 	int i, j;
 	const VALUE *argv = args_rest_argv(args);
+	VALUE *const locals = args->locals + locals_off;
 
 	for (i=args->argc, j=0; i<argc; i++, j++) {
 	    locals[i] = argv[j];
@@ -298,17 +286,17 @@ args_setup_lead_parameters(struct args_info *args, int argc, VALUE *locals)
 }
 
 static inline void
-args_setup_post_parameters(struct args_info *args, int argc, VALUE *locals)
+args_setup_post_parameters(struct rb_vm_args_info *args, int argc, int locals_off)
 {
     long len;
     args_copy(args);
     len = RARRAY_LEN(args->rest);
-    MEMCPY(locals, RARRAY_CONST_PTR(args->rest) + len - argc, VALUE, argc);
+    MEMCPY(args->locals + locals_off, RARRAY_CONST_PTR(args->rest) + len - argc, VALUE, argc);
     rb_ary_resize(args->rest, len - argc);
 }
 
 static inline int
-args_setup_opt_parameters(struct args_info *args, int opt_max, VALUE *locals)
+args_setup_opt_parameters(struct rb_vm_args_info *args, int opt_max, int locals_off)
 {
     int i;
 
@@ -319,6 +307,7 @@ args_setup_opt_parameters(struct args_info *args, int opt_max, VALUE *locals)
     }
     else {
 	int j;
+	VALUE *const locals = args->locals + locals_off;
 	i = args->argc;
 	args->argc = 0;
 
@@ -341,10 +330,10 @@ args_setup_opt_parameters(struct args_info *args, int opt_max, VALUE *locals)
 }
 
 static inline void
-args_setup_rest_parameter(struct args_info *args, VALUE *locals)
+args_setup_rest_parameter(struct rb_vm_args_info *args, int locals_off)
 {
     args_copy(args);
-    *locals = args_rest_array(args);
+    args->locals[locals_off] = args_rest_array(args);
 }
 
 static VALUE
@@ -393,8 +382,8 @@ args_setup_kw_parameters_lookup(const ID key, VALUE *ptr, const VALUE *const pas
 }
 
 static void
-args_setup_kw_parameters(VALUE* const passed_values, const int passed_keyword_len, const VALUE *const passed_keywords,
-			 const rb_iseq_t * const iseq, VALUE * const locals)
+args_setup_kw_parameters(struct rb_vm_args_info *args, VALUE* const passed_values, const int passed_keyword_len, const VALUE *const passed_keywords,
+			 const rb_iseq_t * const iseq, int locals_off)
 {
     const ID *acceptable_keywords = iseq->body->param.keyword->table;
     const int req_key_num = iseq->body->param.keyword->required_num;
@@ -407,7 +396,7 @@ args_setup_kw_parameters(VALUE* const passed_values, const int passed_keyword_le
 
     for (i=0; i<req_key_num; i++) {
 	ID key = acceptable_keywords[i];
-	if (args_setup_kw_parameters_lookup(key, &locals[i], passed_keywords, passed_values, passed_keyword_len)) {
+	if (args_setup_kw_parameters_lookup(key, args->locals + locals_off + i, passed_keywords, passed_values, passed_keyword_len)) {
 	    found++;
 	}
 	else {
@@ -419,12 +408,12 @@ args_setup_kw_parameters(VALUE* const passed_values, const int passed_keyword_le
     if (missing) argument_kw_error(GET_THREAD(), iseq, "missing", missing);
 
     for (di=0; i<key_num; i++, di++) {
-	if (args_setup_kw_parameters_lookup(acceptable_keywords[i], &locals[i], passed_keywords, passed_values, passed_keyword_len)) {
+	if (args_setup_kw_parameters_lookup(acceptable_keywords[i], args->locals + locals_off + i, passed_keywords, passed_values, passed_keyword_len)) {
 	    found++;
 	}
 	else {
 	    if (default_values[di] == Qundef) {
-		locals[i] = Qnil;
+		args->locals[locals_off + i] = Qnil;
 
 		if (LIKELY(i < 32)) { /* TODO: 32 -> Fixnum's max bits */
 		    unspecified_bits |= 0x01 << di;
@@ -445,14 +434,14 @@ args_setup_kw_parameters(VALUE* const passed_values, const int passed_keyword_le
 		}
 	    }
 	    else {
-		locals[i] = default_values[di];
+		args->locals[locals_off + i] = default_values[di];
 	    }
 	}
     }
 
     if (iseq->body->param.flags.has_kwrest) {
 	const int rest_hash_index = key_num + 1;
-	locals[rest_hash_index] = make_rest_kw_hash(passed_keywords, passed_keyword_len, passed_values);
+	args->locals[locals_off + rest_hash_index] = make_rest_kw_hash(passed_keywords, passed_keyword_len, passed_values);
     }
     else {
 	if (found != passed_keyword_len) {
@@ -464,20 +453,20 @@ args_setup_kw_parameters(VALUE* const passed_values, const int passed_keyword_le
     if (NIL_P(unspecified_bits_value)) {
 	unspecified_bits_value = INT2FIX(unspecified_bits);
     }
-    locals[key_num] = unspecified_bits_value;
+    args->locals[locals_off + key_num] = unspecified_bits_value;
 }
 
 static inline void
-args_setup_kw_rest_parameter(VALUE keyword_hash, VALUE *locals)
+args_setup_kw_rest_parameter(struct rb_vm_args_info *args, VALUE keyword_hash, int locals_off)
 {
-    locals[0] = NIL_P(keyword_hash) ? rb_hash_new() : rb_hash_dup(keyword_hash);
+    args->locals[locals_off] = NIL_P(keyword_hash) ? rb_hash_new() : rb_hash_dup(keyword_hash);
 }
 
 static inline void
-args_setup_block_parameter(rb_thread_t *th, struct rb_calling_info *calling, VALUE *locals)
+args_setup_block_parameter(rb_thread_t *th, struct rb_calling_info *calling, int locals_off)
 {
     VALUE block_handler = calling->block_handler;
-    *locals = rb_vm_bh_to_procval(th, block_handler);
+    th->ec.args_info.locals[locals_off] = rb_vm_bh_to_procval(th, block_handler);
 }
 
 struct fill_values_arg {
@@ -506,9 +495,9 @@ setup_parameters_complex(rb_thread_t * const th, const rb_iseq_t * const iseq,
     const int max_argc = (iseq->body->param.flags.has_rest == FALSE) ? min_argc + iseq->body->param.opt_num : UNLIMITED_ARGUMENTS;
     int opt_pc = 0;
     int given_argc;
-    struct args_info args_body, *args;
+    struct rb_vm_args_info *args;
     VALUE keyword_hash = Qnil;
-    VALUE * const orig_sp = th->ec.cfp->sp;
+    rb_stack_index_t orig_spi = vm_stack_ptr_save(&th->ec, th->ec.cfp->sp);
     unsigned int i;
 
     /*
@@ -528,12 +517,12 @@ setup_parameters_complex(rb_thread_t * const th, const rb_iseq_t * const iseq,
     for (i=calling->argc; i<iseq->body->param.size; i++) {
 	locals[i] = Qnil;
     }
-    th->ec.cfp->sp = &locals[i];
+    th->ec.cfp->sp = locals + i;
 
     /* setup args */
-    args = &args_body;
+    args = &th->ec.args_info;
     given_argc = args->argc = calling->argc;
-    args->argv = locals;
+    args->argv = args->locals = locals;
 
     if (ci->flag & VM_CALL_KWARG) {
 	args->kw_arg = ((struct rb_call_info_with_kwarg *)ci)->kw_arg;
@@ -544,7 +533,7 @@ setup_parameters_complex(rb_thread_t * const th, const rb_iseq_t * const iseq,
 	    args->kw_argv = ALLOCA_N(VALUE, kw_len);
 	    args->argc -= kw_len;
 	    given_argc -= kw_len;
-	    MEMCPY(args->kw_argv, locals + args->argc, VALUE, kw_len);
+	    MEMCPY(args->kw_argv, args->locals + args->argc, VALUE, kw_len);
 	}
 	else {
 	    args->kw_argv = NULL;
@@ -557,7 +546,7 @@ setup_parameters_complex(rb_thread_t * const th, const rb_iseq_t * const iseq,
     }
 
     if (ci->flag & VM_CALL_ARGS_SPLAT) {
-	args->rest = locals[--args->argc];
+	args->rest = args->locals[--args->argc];
 	args->rest_index = 0;
 	given_argc += RARRAY_LENINT(args->rest) - 1;
     }
@@ -587,7 +576,7 @@ setup_parameters_complex(rb_thread_t * const th, const rb_iseq_t * const iseq,
 	}
 	else {
 	    if (arg_setup_type == arg_setup_block) {
-		CHECK_VM_STACK_OVERFLOW(th->ec.cfp, min_argc);
+		CHECK_VM_STACK_OVERFLOW(&th->ec, th->ec.cfp, min_argc);
 		given_argc = min_argc;
 		args_extend(args, min_argc);
 	    }
@@ -619,28 +608,28 @@ setup_parameters_complex(rb_thread_t * const th, const rb_iseq_t * const iseq,
     }
 
     if (iseq->body->param.flags.has_lead) {
-	args_setup_lead_parameters(args, iseq->body->param.lead_num, locals + 0);
+	args_setup_lead_parameters(args, iseq->body->param.lead_num, 0);
     }
 
     if (iseq->body->param.flags.has_post) {
-	args_setup_post_parameters(args, iseq->body->param.post_num, locals + iseq->body->param.post_start);
+	args_setup_post_parameters(args, iseq->body->param.post_num, iseq->body->param.post_start);
     }
 
     if (iseq->body->param.flags.has_opt) {
-	int opt = args_setup_opt_parameters(args, iseq->body->param.opt_num, locals + iseq->body->param.lead_num);
+	int opt = args_setup_opt_parameters(args, iseq->body->param.opt_num, iseq->body->param.lead_num);
 	opt_pc = (int)iseq->body->param.opt_table[opt];
     }
 
     if (iseq->body->param.flags.has_rest) {
-	args_setup_rest_parameter(args, locals + iseq->body->param.rest_start);
+	args_setup_rest_parameter(args, iseq->body->param.rest_start);
     }
 
     if (iseq->body->param.flags.has_kw) {
-	VALUE * const klocals = locals + iseq->body->param.keyword->bits_start - iseq->body->param.keyword->num;
+	int klocals_off = iseq->body->param.keyword->bits_start - iseq->body->param.keyword->num;
 
 	if (args->kw_argv != NULL) {
 	    const struct rb_call_info_kw_arg *kw_arg = args->kw_arg;
-	    args_setup_kw_parameters(args->kw_argv, kw_arg->keyword_len, kw_arg->keywords, iseq, klocals);
+	    args_setup_kw_parameters(args, args->kw_argv, kw_arg->keyword_len, kw_arg->keywords, iseq, klocals_off);
 	}
 	else if (!NIL_P(keyword_hash)) {
 	    int kw_len = rb_long2int(RHASH_SIZE(keyword_hash));
@@ -651,15 +640,15 @@ setup_parameters_complex(rb_thread_t * const th, const rb_iseq_t * const iseq,
 	    arg.argc = 0;
 	    rb_hash_foreach(keyword_hash, fill_keys_values, (VALUE)&arg);
 	    VM_ASSERT(arg.argc == kw_len);
-	    args_setup_kw_parameters(arg.vals, kw_len, arg.keys, iseq, klocals);
+	    args_setup_kw_parameters(args, arg.vals, kw_len, arg.keys, iseq, klocals_off);
 	}
 	else {
 	    VM_ASSERT(args_argc(args) == 0);
-	    args_setup_kw_parameters(NULL, 0, NULL, iseq, klocals);
+	    args_setup_kw_parameters(args, NULL, 0, NULL, iseq, klocals_off);
 	}
     }
     else if (iseq->body->param.flags.has_kwrest) {
-	args_setup_kw_rest_parameter(keyword_hash, locals + iseq->body->param.keyword->rest_start);
+	args_setup_kw_rest_parameter(args, keyword_hash, iseq->body->param.keyword->rest_start);
     }
     else if (!NIL_P(keyword_hash) && RHASH_SIZE(keyword_hash) > 0) {
 	argument_kw_error(th, iseq, "unknown", rb_hash_keys(keyword_hash));
@@ -670,7 +659,7 @@ setup_parameters_complex(rb_thread_t * const th, const rb_iseq_t * const iseq,
 	    /* Do nothing */
 	}
 	else {
-	    args_setup_block_parameter(th, calling, locals + iseq->body->param.block_start);
+	    args_setup_block_parameter(th, calling, iseq->body->param.block_start);
 	}
     }
 
@@ -678,12 +667,13 @@ setup_parameters_complex(rb_thread_t * const th, const rb_iseq_t * const iseq,
     {
 	int i;
 	for (i=0; i<iseq->body->param.size; i++) {
-	    fprintf(stderr, "local[%d] = %p\n", i, (void *)locals[i]);
+	    fprintf(stderr, "local[%d] = %p\n", i, (void *)args->locals[i]);
 	}
     }
 #endif
 
-    th->ec.cfp->sp = orig_sp;
+    th->ec.cfp->sp = vm_stack_ptr_restore(&th->ec, orig_spi);
+    args->argv = args->kw_argv = args->locals = NULL;
     return opt_pc;
 }
 
@@ -753,7 +743,7 @@ vm_caller_setup_arg_splat(rb_control_frame_t *cfp, struct rb_calling_info *calli
 	const VALUE *ptr = RARRAY_CONST_PTR(ary);
 	long len = RARRAY_LEN(ary), i;
 
-	CHECK_VM_STACK_OVERFLOW(cfp, len);
+	CHECK_VM_STACK_OVERFLOW(&GET_THREAD()->ec, cfp, len);
 
 	for (i = 0; i < len; i++) {
 	    *cfp->sp++ = ptr[i];

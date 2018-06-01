@@ -556,13 +556,18 @@ newhash
 (...)
 (VALUE val) // inc += 1 - num;
 {
+    VALUE *argv;
     RUBY_DTRACE_CREATE_HOOK(HASH, num);
 
     val = rb_hash_new_with_size(num / 2);
 
+    argv = ALLOC_N(VALUE, num);
+    MEMCPY(argv, STACK_ADDR_FROM_TOP(num), VALUE, num);
+
     if (num) {
-        rb_hash_bulk_insert(num, STACK_ADDR_FROM_TOP(num), val);
+        rb_hash_bulk_insert(num, argv, val);
     }
+    ruby_xfree(argv);
     POPN(num);
 }
 

@@ -2,7 +2,7 @@
 
   eval.c -
 
-  $Author$
+  $Author: nobu $
   created at: Thu Jun 10 14:22:17 JST 1993
 
   Copyright (C) 1993-2007 Yukihiro Matsumoto
@@ -1127,7 +1127,7 @@ previous_frame(rb_thread_t *th)
 {
     rb_control_frame_t *prev_cfp = RUBY_VM_PREVIOUS_CONTROL_FRAME(th->ec.cfp);
     /* check if prev_cfp can be accessible */
-    if ((void *)(th->ec.vm_stack + th->ec.vm_stack_size) == (void *)(prev_cfp)) {
+    if ((void *)(th->ec.eocfp) == (void *)(prev_cfp)) {
         return 0;
     }
     return prev_cfp;
@@ -1164,7 +1164,7 @@ rb_frame_last_func(void)
 
     while (!(mid = frame_func_id(cfp)) &&
 	   (cfp = RUBY_VM_PREVIOUS_CONTROL_FRAME(cfp),
-	    !RUBY_VM_CONTROL_FRAME_STACK_OVERFLOW_P(th, cfp)));
+	    cfp != RUBY_VM_END_CONTROL_FRAME(th)));
     return mid;
 }
 
@@ -1725,9 +1725,10 @@ static const VALUE *
 errinfo_place(rb_thread_t *th)
 {
     rb_control_frame_t *cfp = th->ec.cfp;
-    rb_control_frame_t *end_cfp = RUBY_VM_END_CONTROL_FRAME(th);
+    rb_control_frame_t *eocfp = RUBY_VM_END_CONTROL_FRAME(th);
 
-    while (RUBY_VM_VALID_CONTROL_FRAME_P(cfp, end_cfp)) {
+    while (cfp != eocfp) {
+	VM_ASSERT(cfp);
 	if (VM_FRAME_RUBYFRAME_P(cfp)) {
 	    if (cfp->iseq->body->type == ISEQ_TYPE_RESCUE) {
 		return &cfp->ep[VM_ENV_INDEX_LAST_LVAR];

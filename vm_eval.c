@@ -2,7 +2,7 @@
 
   vm_eval.c -
 
-  $Author$
+  $Author: nobu $
   created at: Sat May 24 16:02:32 JST 2008
 
   Copyright (C) 1993-2007 Yukihiro Matsumoto
@@ -71,6 +71,8 @@ vm_call0_cfunc_with_frame(rb_thread_t* th, struct rb_calling_info *calling, cons
     ID mid = ci->mid;
     VALUE block_handler = calling->block_handler;
 
+    VM_ASSERT(!VM_EC_PTR_IN_INTERNAL_STACK_P(&th->ec, argv));
+
     RUBY_DTRACE_CMETHOD_ENTRY_HOOK(th, me->owner, me->def->original_id);
     EXEC_EVENT_HOOK(th, RUBY_EVENT_C_CALL, recv, me->def->original_id, mid, me->owner, Qnil);
     {
@@ -116,7 +118,7 @@ vm_call0_body(rb_thread_t* th, struct rb_calling_info *calling, const struct rb_
 	    rb_control_frame_t *reg_cfp = th->ec.cfp;
 	    int i;
 
-	    CHECK_VM_STACK_OVERFLOW(reg_cfp, calling->argc + 1);
+	    CHECK_VM_STACK_OVERFLOW(&th->ec, reg_cfp, calling->argc + 1);
 
 	    *reg_cfp->sp++ = calling->recv;
 	    for (i = 0; i < calling->argc; i++) {
@@ -851,7 +853,7 @@ static VALUE *
 current_vm_stack_arg(rb_thread_t *th, const VALUE *argv)
 {
     rb_control_frame_t *prev_cfp = RUBY_VM_PREVIOUS_CONTROL_FRAME(th->ec.cfp);
-    if (RUBY_VM_CONTROL_FRAME_STACK_OVERFLOW_P(th, prev_cfp)) return NULL;
+    if (prev_cfp == RUBY_VM_END_CONTROL_FRAME(th)) return NULL;
     if (prev_cfp->sp + 1 != argv) return NULL;
     return prev_cfp->sp + 1;
 }
@@ -1280,6 +1282,7 @@ eval_string_with_cref(VALUE self, VALUE src, VALUE scope, rb_cref_t *const cref_
 	const rb_iseq_t *iseq;
 	VALUE realpath = Qnil;
 	VALUE fname;
+	rb_stack_index_t saved_ep = 0;
 
 	if (file != Qundef) {
 	    realpath = file;
@@ -1304,6 +1307,9 @@ eval_string_with_cref(VALUE self, VALUE src, VALUE scope, rb_cref_t *const cref_
 		block.as.captured.code.iseq = cfp->iseq;
 		block.type = block_type_iseq;
 		base_block = &block;
+		if (VM_EC_PTR_IN_INTERNAL_STACK_P(&th->ec, block.as.captured.ep)) {
+		    saved_ep = vm_stack_ptr_save(&th->ec, block.as.captured.ep);
+		}
 	    }
 	    else {
 		rb_raise(rb_eRuntimeError, "Can't eval on top of Fiber or Thread");
@@ -1316,6 +1322,10 @@ eval_string_with_cref(VALUE self, VALUE src, VALUE scope, rb_cref_t *const cref_
 
 	/* make eval iseq */
 	iseq = rb_iseq_compile_with_option(src, fname, realpath, INT2FIX(line), base_block, Qnil);
+
+	if (saved_ep) {
+	    *(VALUE **)&base_block->as.captured.ep = vm_stack_ptr_restore(&th->ec, saved_ep);
+	}
 
 	if (!iseq) {
 	    rb_exc_raise(adjust_backtrace_in_eval(th, th->ec.errinfo));

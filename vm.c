@@ -2,7 +2,7 @@
 
   vm.c -
 
-  $Author$
+  $Author: mame $
 
   Copyright (C) 2004-2007 Koichi Sasada
 
@@ -18,6 +18,13 @@
 #include "eval_intern.h"
 #include "probes.h"
 #include "probes_helper.h"
+
+#if VM_STACK_USE_MPROTECT
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
+#endif
 
 VALUE rb_str_concat_literals(size_t, const VALUE*);
 
@@ -40,7 +47,8 @@ rb_vm_search_cf_from_ep(const rb_thread_t * const th, const rb_control_frame_t *
     else {
 	const rb_control_frame_t * const eocfp = RUBY_VM_END_CONTROL_FRAME(th); /* end of control frame pointer */
 
-	while (cfp < eocfp) {
+	while (cfp != eocfp) {
+	    VM_ASSERT(cfp);
 	    if (cfp->ep == ep) {
 		return cfp;
 	    }
@@ -86,25 +94,33 @@ rb_vm_frame_block_handler(const rb_control_frame_t *cfp)
 
 #if VM_CHECK_MODE > 0
 static int
+VM_CFP_IN_CONTROL_FRAME_LIST(const rb_control_frame_t *target, const rb_control_frame_t *root, const rb_control_frame_t *end)
+{
+    const rb_control_frame_t *cfp = root;
+    for (; cfp; cfp = RUBY_VM_NEXT_CONTROL_FRAME(cfp)) {
+	if (cfp == target) {
+	    return TRUE;
+	}
+    }
+    return FALSE;
+}
+
+static int
 VM_CFP_IN_HEAP_P(const rb_thread_t *th, const rb_control_frame_t *cfp)
 {
-    const VALUE *start = th->ec.vm_stack;
-    const VALUE *end = (VALUE *)th->ec.vm_stack + th->ec.vm_stack_size;
-    VM_ASSERT(start != NULL);
+    const rb_control_frame_t *root = th->ec.eocfp;
+    const rb_control_frame_t *end = th->ec.cfp;
+    VM_ASSERT(root != NULL);
+    VM_ASSERT(end != NULL);
 
-    if (start <= (VALUE *)cfp && (VALUE *)cfp < end) {
-	return FALSE;
-    }
-    else {
-	return TRUE;
-    }
+    return VM_CFP_IN_CONTROL_FRAME_LIST(cfp, root, end) ? FALSE : TRUE;
 }
 
 static int
 VM_EP_IN_HEAP_P(const rb_execution_context_t *ec, const VALUE *ep)
 {
     const VALUE *start = ec->vm_stack;
-    const VALUE *end = (VALUE *)ec->cfp;
+    const VALUE *end = ec->vm_stack + ec->vm_stack_size;
     VM_ASSERT(start != NULL);
 
     if (start <= ep && ep < end) {
@@ -154,7 +170,7 @@ VM_CAPTURED_BLOCK_TO_CFP(const struct rb_captured_block *captured)
 {
     rb_control_frame_t *cfp = ((rb_control_frame_t *)((VALUE *)(captured) - 3));
     VM_ASSERT(!VM_CFP_IN_HEAP_P(GET_THREAD(), cfp));
-    VM_ASSERT(sizeof(rb_control_frame_t)/sizeof(VALUE) == 6 + VM_DEBUG_BP_CHECK ? 1 : 0);
+    VM_ASSERT(sizeof(rb_control_frame_t)/sizeof(VALUE) == 8 + VM_DEBUG_BP_CHECK ? 1 : 0);
     return cfp;
 }
 
@@ -485,7 +501,7 @@ vm_set_main_stack(rb_thread_t *th, const rb_iseq_t *iseq)
 rb_control_frame_t *
 rb_vm_get_binding_creatable_next_cfp(const rb_thread_t *th, const rb_control_frame_t *cfp)
 {
-    while (!RUBY_VM_CONTROL_FRAME_STACK_OVERFLOW_P(th, cfp)) {
+    while (cfp != RUBY_VM_END_CONTROL_FRAME(th)) {
 	if (cfp->iseq) {
 	    return (rb_control_frame_t *)cfp;
 	}
@@ -497,7 +513,7 @@ rb_vm_get_binding_creatable_next_cfp(const rb_thread_t *th, const rb_control_fra
 rb_control_frame_t *
 rb_vm_get_ruby_level_next_cfp(const rb_thread_t *th, const rb_control_frame_t *cfp)
 {
-    while (!RUBY_VM_CONTROL_FRAME_STACK_OVERFLOW_P(th, cfp)) {
+    while (cfp != RUBY_VM_END_CONTROL_FRAME(th)) {
 	if (VM_FRAME_RUBYFRAME_P(cfp)) {
 	    return (rb_control_frame_t *)cfp;
 	}
@@ -515,7 +531,7 @@ vm_get_ruby_level_caller_cfp(const rb_thread_t *th, const rb_control_frame_t *cf
 
     cfp = RUBY_VM_PREVIOUS_CONTROL_FRAME(cfp);
 
-    while (!RUBY_VM_CONTROL_FRAME_STACK_OVERFLOW_P(th, cfp)) {
+    while (cfp != RUBY_VM_END_CONTROL_FRAME(th)) {
 	if (VM_FRAME_RUBYFRAME_P(cfp)) {
 	    return (rb_control_frame_t *)cfp;
 	}
@@ -1016,12 +1032,15 @@ invoke_iseq_block_from_c(rb_thread_t *th, const struct rb_captured_block *captur
     int i, opt_pc;
     VALUE type = VM_FRAME_MAGIC_BLOCK | (is_lambda ? VM_FRAME_FLAG_LAMBDA : 0);
     rb_control_frame_t *cfp = th->ec.cfp;
-    VALUE *sp = cfp->sp;
+    rb_stack_index_t saved_sp = vm_stack_ptr_save(&th->ec, th->ec.cfp->sp);
+    VALUE *sp;
     const rb_callable_method_entry_t *me = th->passed_bmethod_me;
     th->passed_bmethod_me = NULL;
     stack_check(th);
 
-    CHECK_VM_STACK_OVERFLOW(cfp, argc);
+    CHECK_VM_STACK_OVERFLOW(&th->ec, cfp, argc);
+
+    sp = vm_stack_ptr_restore(&th->ec, saved_sp);
     cfp->sp = sp + argc;
     for (i=0; i<argc; i++) {
 	sp[i] = argv[i];
@@ -1029,7 +1048,7 @@ invoke_iseq_block_from_c(rb_thread_t *th, const struct rb_captured_block *captur
 
     opt_pc = vm_yield_setup_args(th, iseq, argc, sp, passed_block_handler,
 				 (is_lambda ? arg_setup_method : arg_setup_block));
-    cfp->sp = sp;
+    cfp->sp = vm_stack_ptr_restore(&th->ec, saved_sp);
 
     if (me == NULL) {
 	return invoke_block(th, iseq, self, captured, cref, type, opt_pc);
@@ -1191,7 +1210,7 @@ vm_normal_frame(rb_thread_t *th, rb_control_frame_t *cfp)
 {
     while (cfp->pc == 0) {
 	cfp = RUBY_VM_PREVIOUS_CONTROL_FRAME(cfp);
-	if (RUBY_VM_CONTROL_FRAME_STACK_OVERFLOW_P(th, cfp)) {
+	if (cfp == RUBY_VM_END_CONTROL_FRAME(th)) {
 	    return 0;
 	}
     }
@@ -1841,7 +1860,7 @@ vm_exec(rb_thread_t *th)
 	    if (cfp == escape_cfp) {
 		if (state == TAG_RETURN) {
 		    if (!VM_FRAME_FINISHED_P(cfp)) {
-			THROW_DATA_CATCH_FRAME_SET(err, cfp + 1);
+			THROW_DATA_CATCH_FRAME_SET(err, RUBY_VM_PREVIOUS_CONTROL_FRAME(cfp));
 			THROW_DATA_STATE_SET(err, state = TAG_BREAK);
 		    }
 		    else {
@@ -1860,7 +1879,7 @@ vm_exec(rb_thread_t *th)
 			if (catch_iseq == NULL) {
 			    th->ec.errinfo = Qnil;
 			    result = THROW_DATA_VAL(err);
-			    THROW_DATA_CATCH_FRAME_SET(err, cfp + 1);
+			    THROW_DATA_CATCH_FRAME_SET(err, RUBY_VM_PREVIOUS_CONTROL_FRAME(cfp));
 			    hook_before_rewind(th, th->ec.cfp, TRUE, state, err);
 			    rb_vm_pop_frame(th);
 			    goto finish_vme;
@@ -2250,8 +2269,10 @@ vm_default_params(void)
     VALUE result = rb_hash_new();
 #define SET(name) rb_hash_aset(result, ID2SYM(rb_intern(#name)), SIZET2NUM(vm->default_params.name));
     SET(thread_vm_stack_size);
+    SET(thread_vm_stack_initial_size);
     SET(thread_machine_stack_size);
     SET(fiber_vm_stack_size);
+    SET(fiber_vm_stack_initial_size);
     SET(fiber_machine_stack_size);
 #undef SET
     rb_obj_freeze(result);
@@ -2276,6 +2297,12 @@ get_param(const char *name, size_t default_value, size_t min_value)
 }
 
 static void
+check_vm_stack_size(size_t *initial_size, size_t max_size)
+{
+    *initial_size = (*initial_size <= max_size) ? *initial_size : max_size;
+}
+
+static void
 check_machine_stack_size(size_t *sizep)
 {
 #ifdef PTHREAD_STACK_MIN
@@ -2297,6 +2324,11 @@ vm_default_params_setup(rb_vm_t *vm)
 		RUBY_VM_THREAD_VM_STACK_SIZE,
 		RUBY_VM_THREAD_VM_STACK_SIZE_MIN);
 
+    vm->default_params.thread_vm_stack_initial_size =
+      get_param("RUBY_THREAD_VM_STACK_INITIAL_SIZE",
+		RUBY_VM_THREAD_VM_STACK_INITIAL_SIZE,
+		RUBY_VM_THREAD_VM_STACK_INITIAL_SIZE_MIN);
+
     vm->default_params.thread_machine_stack_size =
       get_param("RUBY_THREAD_MACHINE_STACK_SIZE",
 		RUBY_VM_THREAD_MACHINE_STACK_SIZE,
@@ -2307,10 +2339,22 @@ vm_default_params_setup(rb_vm_t *vm)
 		RUBY_VM_FIBER_VM_STACK_SIZE,
 		RUBY_VM_FIBER_VM_STACK_SIZE_MIN);
 
+    vm->default_params.fiber_vm_stack_initial_size =
+      get_param("RUBY_FIBER_VM_STACK_INITIAL_SIZE",
+		RUBY_VM_FIBER_VM_STACK_INITIAL_SIZE,
+		RUBY_VM_FIBER_VM_STACK_INITIAL_SIZE_MIN);
+
     vm->default_params.fiber_machine_stack_size =
       get_param("RUBY_FIBER_MACHINE_STACK_SIZE",
 		RUBY_VM_FIBER_MACHINE_STACK_SIZE,
 		RUBY_VM_FIBER_MACHINE_STACK_SIZE_MIN);
+
+    check_vm_stack_size(
+	    &vm->default_params.thread_vm_stack_initial_size,
+	    vm->default_params.thread_vm_stack_size);
+    check_vm_stack_size(
+	    &vm->default_params.fiber_vm_stack_initial_size,
+	    vm->default_params.fiber_vm_stack_size);
 
     /* environment dependent check */
     check_machine_stack_size(&vm->default_params.thread_machine_stack_size);
@@ -2329,7 +2373,7 @@ vm_init2(rb_vm_t *vm)
 
 /* Thread */
 
-#define USE_THREAD_DATA_RECYCLE 1
+#define USE_THREAD_DATA_RECYCLE 0
 
 #if USE_THREAD_DATA_RECYCLE
 #define RECYCLE_MAX 64
@@ -2366,24 +2410,106 @@ rb_thread_recycle_stack_release(VALUE *stack)
     ruby_xfree(stack);
 }
 
+#if VM_STACK_USE_MPROTECT
+static VALUE *
+thread_vm_stack_allocate(size_t size)
+{
+    VALUE *stack;
+
+    if ((stack = mmap(NULL, size * sizeof(VALUE), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0))
+	    == MAP_FAILED) {
+	fprintf(stderr, "[FATAL] failed to allocate vm stack\n");
+	exit(EXIT_FAILURE);
+	return NULL;
+    }
+
+    return stack;
+}
+#else
+# define thread_vm_stack_allocate(size) ALLOC_N(VALUE, (size))
+#endif
+
+VALUE *rb_thread_vm_stack_allocate(size_t size)
+{
+    return thread_vm_stack_allocate(size);
+}
+
+VALUE *rb_thread_vm_stack_reallocate(VALUE *stack, size_t new_size)
+{
+#if VM_STACK_USE_MPROTECT
+    return rb_thread_vm_stack_allocate(new_size);
+#else
+    return REALLOC_N(stack, VALUE, new_size);
+#endif
+}
+
+void rb_thread_vm_stack_release(VALUE *stack, size_t size)
+{
+    VM_ASSERT(stack != NULL);
+#if VM_STACK_USE_MPROTECT
+    mprotect(stack, size * sizeof(VALUE), PROT_NONE);
+    madvise(stack, size * sizeof(VALUE), MADV_DONTNEED);
+#else
+    ruby_xfree(stack);
+#endif
+}
+
+rb_control_frame_t *
+rb_control_frame_alloc(void)
+{
+    rb_control_frame_t *cfp = ALLOC(rb_control_frame_t);
+    MEMZERO(cfp, rb_control_frame_t, 1);
+    return cfp;
+}
+
+void
+rb_control_frame_release(rb_control_frame_t *cfp)
+{
+    VM_ASSERT(cfp != NULL);
+    return ruby_xfree(cfp);
+}
+
+rb_control_frame_t *
+rb_vm_control_frame_list_allocate(size_t length)
+{
+    rb_control_frame_t *cf_list = ALLOC_N(rb_control_frame_t, length);
+    size_t i = 0;
+
+    VM_ASSERT(length > 0);
+    for (; i < length; i++) {
+	cf_list[i].prev = (i == 0) ? NULL : &cf_list[i - 1];
+	cf_list[i].next = (i == length - 1) ? NULL : &cf_list[i + 1];
+    }
+    return cf_list;
+}
+
+void
+rb_vm_control_frame_list_release(rb_control_frame_t *cfp)
+{
+    VM_ASSERT(cfp != NULL);
+    for (; cfp; cfp = RUBY_VM_NEXT_CONTROL_FRAME(cfp)) {
+	ruby_xfree(cfp);
+    }
+}
+
 void rb_fiber_mark_self(rb_fiber_t *fib);
 
 void
 rb_execution_context_mark(const rb_execution_context_t *ec)
 {
     /* mark VM stack */
-    if (ec->vm_stack) {
+    if (ec->vm_stack && ec->cfp && ec->eocfp) {
 	VALUE *p = ec->vm_stack;
 	VALUE *sp = ec->cfp->sp;
 	rb_control_frame_t *cfp = ec->cfp;
-	rb_control_frame_t *limit_cfp = (void *)(ec->vm_stack + ec->vm_stack_size);
+	rb_control_frame_t *limit_cfp = ec->eocfp;
 
 	rb_gc_mark_values((long)(sp - p), p);
 
 	while (cfp != limit_cfp) {
+	    VM_ASSERT(cfp != NULL);
 #if VM_CHECK_MODE > 0
-	    const VALUE *ep = cfp->ep;
-	    VM_ASSERT(!!VM_ENV_FLAGS(ep, VM_ENV_FLAG_ESCAPED) == vm_ep_in_heap_p_(ec, ep));
+	    VM_ASSERT(!!VM_ENV_FLAGS(cfp->ep, VM_ENV_FLAG_ESCAPED) == vm_ep_in_heap_p_(ec, cfp->ep));
 #endif
 	    rb_gc_mark(cfp->self);
 	    rb_gc_mark((VALUE)cfp->iseq);
@@ -2444,8 +2570,13 @@ thread_free(void *ptr)
     rb_thread_t *th = ptr;
     RUBY_FREE_ENTER("thread");
 
+    if (th->ec.eocfp != NULL) {
+	rb_vm_control_frame_list_release(th->ec.eocfp);
+	th->ec.eocfp = NULL;
+	th->ec.cfp = NULL;
+    }
     if (th->ec.vm_stack != NULL) {
-	rb_thread_recycle_stack_release(th->ec.vm_stack);
+	rb_thread_vm_stack_release(th->ec.vm_stack, th->ec.vm_stack_size);
 	th->ec.vm_stack = NULL;
     }
 
@@ -2537,10 +2668,20 @@ th_init(rb_thread_t *th, VALUE self)
     /* th->ec.vm_stack_size is word number.
      * th->vm->default_params.thread_vm_stack_size is byte size.
      */
-    th->ec.vm_stack_size = th->vm->default_params.thread_vm_stack_size / sizeof(VALUE);
-    th->ec.vm_stack = thread_recycle_stack(th->ec.vm_stack_size);
+    th->ec.vm_stack_size = th->vm->default_params.thread_vm_stack_initial_size / sizeof(VALUE);
+    th->ec.vm_stack_max_size = th->vm->default_params.thread_vm_stack_size / sizeof(VALUE);
+#if VM_STACK_EXTEND_LINEAR
+    th->ec.vm_stack_step_size = th->vm->default_params.thread_vm_stack_initial_size / sizeof(VALUE);
+#endif
+    th->ec.vm_stack = rb_thread_vm_stack_allocate(th->ec.vm_stack_size);
+    th->ec.vm_stack_captured = 0;
 
-    th->ec.cfp = (void *)(th->ec.vm_stack + th->ec.vm_stack_size);
+    th->ec.cfp = NULL;
+    th->ec.eocfp = NULL;
+    th->ec.eocfp = rb_control_frame_alloc();
+    th->ec.eocfp->prev = NULL;
+    th->ec.eocfp->next = NULL;
+    th->ec.cfp = th->ec.eocfp;
 
     vm_push_frame(th, 0 /* dummy iseq */, VM_FRAME_MAGIC_DUMMY | VM_ENV_FLAG_LOCAL | VM_FRAME_FLAG_FINISH | VM_FRAME_FLAG_CFRAME /* dummy frame */,
 		  Qnil /* dummy self */, VM_BLOCK_HANDLER_NONE /* dummy block ptr */,
@@ -2617,11 +2758,17 @@ vm_define_method(rb_thread_t *th, VALUE obj, ID id, VALUE iseqval, int is_single
 
 #define REWIND_CFP(expr) do { \
     rb_thread_t *th__ = GET_THREAD(); \
-    VALUE *const curr_sp = (th__->ec.cfp++)->sp; \
-    VALUE *const saved_sp = th__->ec.cfp->sp; \
+    rb_control_frame_t *const saved_cfp = th__->ec.cfp; \
+    VALUE *const curr_sp = th__->ec.cfp->sp; \
+    const rb_stack_index_t saved_sp = vm_stack_ptr_save(&th__->ec, \
+							(th__->ec.cfp = RUBY_VM_PREVIOUS_CONTROL_FRAME(th__->ec.cfp))->sp); \
+    VM_ASSERT(RUBY_VM_NEXT_CONTROL_FRAME(th__->ec.cfp) == saved_cfp); \
     th__->ec.cfp->sp = curr_sp; \
     expr; \
-    (th__->ec.cfp--)->sp = saved_sp; \
+    th__->ec.cfp->sp = vm_stack_ptr_restore(&th__->ec, saved_sp); \
+    VM_ASSERT(RUBY_VM_PREVIOUS_CONTROL_FRAME(saved_cfp) == th__->ec.cfp); \
+    VM_ASSERT(RUBY_VM_NEXT_CONTROL_FRAME(RUBY_VM_PREVIOUS_CONTROL_FRAME(saved_cfp)) == saved_cfp); \
+    th__->ec.cfp = saved_cfp; \
 } while (0)
 
 static VALUE
@@ -3111,8 +3258,7 @@ void
 rb_vm_set_progname(VALUE filename)
 {
     rb_thread_t *th = GET_VM()->main_thread;
-    rb_control_frame_t *cfp = (void *)(th->ec.vm_stack + th->ec.vm_stack_size);
-    --cfp;
+    rb_control_frame_t *cfp = RUBY_VM_FIRST_CONTROL_FRAME(&th->ec);
 
     rb_iseq_pathobj_set(cfp->iseq, rb_str_dup(filename), rb_iseq_realpath(cfp->iseq));
 }

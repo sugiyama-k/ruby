@@ -2,7 +2,7 @@
 
   vm_insnhelper.c - instruction helper functions.
 
-  $Author$
+  $Author: ko1 $
 
   Copyright (C) 2007 Koichi Sasada
 
@@ -196,6 +196,204 @@ vm_check_frame(VALUE type,
 #define vm_check_frame(a, b, c, d)
 #endif /* VM_CHECK_MODE > 0 */
 
+typedef struct vm_adjust_info {
+    VALUE *old_base;
+    size_t old_size;
+    size_t new_size;
+    ptrdiff_t off_base;
+    rb_control_frame_t *cfp;
+    rb_control_frame_t *eocfp;
+} vm_adjust_info_t;
+
+#define VM_PTR_ADJUST(ptr, off) ((VALUE *)ptr + (ptrdiff_t)off)
+
+VALUE *rb_thread_vm_stack_reallocate(VALUE *stack, size_t new_size);
+void rb_thread_vm_stack_release(VALUE *stack, size_t size);
+
+static VALUE
+vm_specval_adjust(vm_adjust_info_t *ai, VALUE specval, VALUE is_local)
+{
+    const VALUE *old_end = ai->old_base + ai->old_size;
+#if VM_CHECK_MODE > 0
+    const VALUE *new_base = ai->old_base + ai->off_base;
+    const VALUE *new_end = new_base + ai->new_size;
+#endif
+    if (!is_local) {
+	/* prev_ep */
+	VM_ASSERT(!VM_PTR_IN_CALL_STACK_P(ai->cfp, ai->eocfp, GC_GUARDED_PTR_REF(specval)));
+	if (VM_PTR_IN_INTERNAL_STACK_P(ai->old_base, old_end, GC_GUARDED_PTR_REF(specval))) {
+	    VM_ASSERT(VM_PTR_IN_INTERNAL_STACK_P(new_base, new_end,
+						 VM_PTR_ADJUST(GC_GUARDED_PTR_REF(specval), ai->off_base)));
+	    return (VALUE)GC_GUARDED_PTR(VM_PTR_ADJUST(GC_GUARDED_PTR_REF(specval), ai->off_base));
+	}
+    }
+    else if (specval != VM_BLOCK_HANDLER_NONE) {
+	/* block_handler */
+	switch (vm_block_handler_type(specval)) {
+	  case block_handler_type_iseq:
+	  case block_handler_type_ifunc:
+	    {
+		struct rb_captured_block *captured = GC_GUARDED_PTR_REF(specval);
+		VM_ASSERT(!VM_PTR_IN_INTERNAL_STACK_P(ai->old_base, old_end, (void *)captured));
+		if (!VM_PTR_IN_CALL_STACK_P(ai->cfp, ai->eocfp, captured)) {
+		    if (VM_PTR_IN_INTERNAL_STACK_P(ai->old_base, old_end, captured->ep)) {
+			captured->ep = VM_PTR_ADJUST(captured->ep, ai->off_base);
+			VM_ASSERT(VM_PTR_IN_INTERNAL_STACK_P(new_base, new_end, captured->ep));
+		    }
+		}
+	    }
+	  default:
+	    return specval;
+	}
+    }
+    return specval;
+}
+
+static void
+vm_stack_relocate(rb_execution_context_t *ec, vm_adjust_info_t *ai)
+{
+    const VALUE *old_end = ai->old_base + ai->old_size;
+#if VM_CHECK_MODE > 0
+    const VALUE *new_base = ai->old_base + ai->off_base;
+    const VALUE *new_end = new_base + ai->new_size;
+#endif
+    const rb_control_frame_t *eocfp = ai->eocfp;
+    rb_control_frame_t *cfp = ai->cfp;
+
+    /* adjust pointer in control frames */
+    for (; cfp != eocfp; cfp = RUBY_VM_PREVIOUS_CONTROL_FRAME(cfp)) {
+	const VALUE *oldep = cfp->ep;
+
+	if (VM_PTR_IN_INTERNAL_STACK_P(ai->old_base, old_end, oldep)) {
+	    cfp->ep = VM_PTR_ADJUST(oldep, ai->off_base);
+	    VM_ASSERT(VM_PTR_IN_INTERNAL_STACK_P(new_base, new_end, cfp->ep));
+	}
+
+	if (oldep) {
+	    VM_FORCE_WRITE(&cfp->ep[VM_ENV_DATA_INDEX_SPECVAL],
+			   vm_specval_adjust(ai, cfp->ep[VM_ENV_DATA_INDEX_SPECVAL], VM_ENV_LOCAL_P(cfp->ep)));
+	}
+
+	VM_ASSERT(VM_PTR_IN_INTERNAL_STACK_P(ai->old_base, old_end, cfp->sp));
+	cfp->sp = VM_PTR_ADJUST(cfp->sp, ai->off_base);
+	VM_ASSERT(VM_PTR_IN_INTERNAL_STACK_P(new_base, new_end, cfp->sp));
+    }
+
+    /* adjust pointers in args_info */
+    {
+	VALUE *locals = ec->args_info.locals;
+	VALUE *argv = ec->args_info.argv;
+	VM_ASSERT(((VALUE)argv & 0x1) == 0);
+	VM_ASSERT(((VALUE)locals & 0x1) == 0);
+	VM_ASSERT(!VM_PTR_IN_INTERNAL_STACK_P(ai->old_base, old_end, ec->args_info.kw_argv));
+	if (VM_PTR_IN_INTERNAL_STACK_P(ai->old_base, old_end, argv)) {
+	    argv = VM_PTR_ADJUST(argv, ai->off_base);
+	    ec->args_info.argv = argv;
+	    VM_ASSERT(VM_PTR_IN_INTERNAL_STACK_P(new_base, new_end, argv));
+	}
+	if (VM_PTR_IN_INTERNAL_STACK_P(ai->old_base, old_end, locals)) {
+	    locals = VM_PTR_ADJUST(locals, ai->off_base);
+	    ec->args_info.locals = locals;
+	    VM_ASSERT(VM_PTR_IN_INTERNAL_STACK_P(new_base, new_end, locals));
+	}
+    }
+}
+
+static void
+vm_adjust_info_set(VALUE *old_stack, size_t old_size,
+		   VALUE *new_stack, size_t new_size,
+		   rb_control_frame_t *cfp,
+		   rb_control_frame_t *eocfp,
+		   vm_adjust_info_t *ai)
+{
+    ai->old_base = old_stack;
+    ai->old_size = old_size;
+    ai->new_size = new_size;
+    ai->off_base = new_stack - old_stack;
+    ai->cfp      = cfp;
+    ai->eocfp    = eocfp;
+}
+
+static void
+vm_stack_extend(rb_execution_context_t *ec, rb_control_frame_t *cfp, VALUE *sp, size_t new_size)
+{
+    vm_adjust_info_t ai;
+
+    VALUE *old_stack = ec->vm_stack;
+    VALUE *new_stack;
+
+    const size_t old_size = ec->vm_stack_size;
+
+    VM_ASSERT(new_size <= ec->vm_stack_max_size);
+
+    new_stack = rb_thread_vm_stack_reallocate(old_stack, new_size);
+    if (new_stack != old_stack) {
+#if VM_STACK_USE_MPROTECT
+	MEMCPY(new_stack, old_stack, VALUE, old_size);
+	rb_thread_vm_stack_release(old_stack, old_size);
+#endif
+	vm_adjust_info_set(old_stack, old_size, new_stack, new_size, cfp, ec->eocfp, &ai);
+	vm_stack_relocate(ec, &ai);
+    }
+    ec->vm_stack = new_stack;
+    ec->vm_stack_size = new_size;
+}
+
+static void
+vm_stack_try_extend(rb_execution_context_t *ec, rb_control_frame_t *cfp, VALUE *sp, size_t required_size)
+{
+    const size_t old_size = ec->vm_stack_size;
+    const size_t max_size = ec->vm_stack_max_size;
+    size_t new_size;
+
+#if VM_STACK_EXTEND_LINEAR
+    new_size = ec->vm_stack_size + VM_STACK_EXTEND_COEF * ec->vm_stack_step_size / sizeof(VALUE);
+#else
+    new_size = ec->vm_stack_size * VM_STACK_EXTEND_BASE;
+#endif
+
+    if (VM_STACK_OVERFLOWED_P(ec, cfp, sp, required_size)) {
+	if (ec->vm_stack_captured) {
+	    vm_stackoverflow();
+	    return;
+	}
+	if (old_size + required_size > max_size) {
+	    vm_stackoverflow();
+	    return;
+	}
+    }
+    else {
+#if VM_STACK_STRESS
+	if (!ec->vm_stack_captured) {
+	    new_size = old_size;
+	    goto extension;
+	}
+#endif
+	return;
+    }
+
+    if (new_size > max_size) {
+	new_size = max_size;
+    }
+    else if (new_size < old_size + required_size) {
+	new_size = old_size + required_size;
+    }
+
+#if VM_STACK_STRESS
+extension:
+#endif
+    vm_stack_extend(ec, cfp, sp, new_size);
+}
+
+void
+rb_vm_stack_extend(rb_execution_context_t *ec, rb_control_frame_t *cfp, VALUE *sp, size_t new_size)
+{
+    vm_stack_extend(ec, cfp, sp, new_size);
+}
+
+rb_control_frame_t * rb_control_frame_alloc(void);
+void rb_control_frame_release(rb_control_frame_t *cfp);
+
 static inline rb_control_frame_t *
 vm_push_frame_(rb_execution_context_t *ec,
 	       const rb_iseq_t *iseq,
@@ -208,15 +406,43 @@ vm_push_frame_(rb_execution_context_t *ec,
 	       int local_size,
 	       int stack_max)
 {
-    rb_control_frame_t *const cfp = ec->cfp - 1;
+    rb_control_frame_t *cfp;
+    rb_stack_index_t saved_sp = vm_stack_ptr_save(ec, sp);
+    int specval_protected = 0;
     int i;
+
+    if (ec->cfp && !RUBY_VM_NEXT_CONTROL_FRAME(ec->cfp)) {
+	VALUE *orig_sp = ec->cfp->sp;
+	ec->cfp->sp = sp; /* move sp for gc */
+	/* TODO: check max length of control frame list */
+	cfp  = rb_control_frame_alloc();
+	ec->cfp->sp = orig_sp;
+	cfp->prev = ec->cfp;
+	cfp->next = NULL;
+    }
+    else {
+	/* use already allocated frame */
+	cfp = RUBY_VM_NEXT_CONTROL_FRAME(ec->cfp);
+    }
 
     vm_check_frame(type, specval, cref_or_me, iseq);
     VM_ASSERT(local_size >= 0);
 
-    /* check stack overflow */
-    CHECK_VM_STACK_OVERFLOW0(cfp, sp, local_size + stack_max);
+    if (!(type & VM_ENV_FLAG_LOCAL) && VM_EC_PTR_IN_INTERNAL_STACK_P(ec, GC_GUARDED_PTR_REF(specval))) {
+	specval = (VALUE *)GC_GUARDED_PTR_REF(specval) - ec->vm_stack;
+	specval_protected = 1;
+    }
 
+    /* check stack overflow */
+    CHECK_VM_STACK_OVERFLOW0(ec, ec->cfp, sp, local_size + stack_max);
+
+    if (specval_protected) {
+	specval = (VALUE)GC_GUARDED_PTR(ec->vm_stack + specval);
+	VM_ASSERT(VM_EC_PTR_IN_INTERNAL_STACK_P(ec, GC_GUARDED_PTR_REF(specval)));
+    }
+    sp = vm_stack_ptr_restore(ec, saved_sp);
+
+    ec->cfp->next = cfp;
     ec->cfp = cfp;
 
     /* setup new frame */
@@ -294,6 +520,8 @@ vm_pop_frame(rb_thread_t *th, rb_control_frame_t *cfp, const VALUE *ep)
     if (VMDEBUG == 2)       SDR();
 
     th->ec.cfp = RUBY_VM_PREVIOUS_CONTROL_FRAME(cfp);
+    VM_ASSERT(RUBY_VM_PREVIOUS_CONTROL_FRAME(cfp) == th->ec.cfp);
+    VM_ASSERT(RUBY_VM_NEXT_CONTROL_FRAME(th->ec.cfp) == cfp);
 
     return flags & VM_FRAME_FLAG_FINISH;
 }
@@ -1118,7 +1346,7 @@ vm_throw_start(rb_thread_t *const th, rb_control_frame_t *const reg_cfp, enum ru
 	else {
 	    ep = VM_ENV_PREV_EP(ep);
 
-	    while (escape_cfp < eocfp) {
+	    while (escape_cfp && escape_cfp != eocfp) {
 		if (escape_cfp->ep == ep) {
 		    const rb_iseq_t *const iseq = escape_cfp->iseq;
 		    const VALUE epc = escape_cfp->pc - iseq->body->iseq_encoded;
@@ -1166,7 +1394,7 @@ vm_throw_start(rb_thread_t *const th, rb_control_frame_t *const reg_cfp, enum ru
 	int toplevel = 1;
 	escape_cfp = reg_cfp;
 
-	while (escape_cfp < eocfp) {
+	while (escape_cfp && escape_cfp != eocfp) {
 	    const VALUE *lep = VM_CF_LEP(escape_cfp);
 
 	    if (!target_lep) {
@@ -1255,7 +1483,8 @@ vm_expandarray(rb_control_frame_t *cfp, VALUE ary, rb_num_t num, int flag)
 {
     int is_splat = flag & 0x01;
     rb_num_t space_size = num + is_splat;
-    VALUE *base = cfp->sp;
+    rb_thread_t *th = GET_THREAD();
+    rb_stack_index_t saved_base = vm_stack_ptr_save(&th->ec, cfp->sp);
     const VALUE *ptr;
     rb_num_t len;
 
@@ -1271,6 +1500,7 @@ vm_expandarray(rb_control_frame_t *cfp, VALUE ary, rb_num_t num, int flag)
     if (flag & 0x02) {
 	/* post: ..., nil ,ary[-1], ..., ary[0..-num] # top */
 	rb_num_t i = 0, j;
+	VALUE *base = vm_stack_ptr_restore(&th->ec, saved_base);
 
 	if (len < num) {
 	    for (i=0; i<num-len; i++) {
@@ -1282,13 +1512,15 @@ vm_expandarray(rb_control_frame_t *cfp, VALUE ary, rb_num_t num, int flag)
 	    *base++ = v;
 	}
 	if (is_splat) {
-	    *base = rb_ary_new4(len - j, ptr);
+	    saved_base = vm_stack_ptr_save(&th->ec, base);
+	    *vm_stack_ptr_restore(&th->ec, saved_base) = rb_ary_new4(len - j, ptr);
 	}
     }
     else {
 	/* normal: ary[num..-1], ary[num-2], ary[num-3], ..., ary[0] # top */
 	rb_num_t i;
-	VALUE *bptr = &base[space_size - 1];
+	VALUE *base = vm_stack_ptr_restore(&th->ec, saved_base);
+	VALUE *bptr = base + space_size - 1;
 
 	for (i=0; i<num; i++) {
 	    if (len <= i) {
@@ -1300,11 +1532,12 @@ vm_expandarray(rb_control_frame_t *cfp, VALUE ary, rb_num_t num, int flag)
 	    *bptr-- = ptr[i];
 	}
 	if (is_splat) {
+	    rb_stack_index_t saved_bptr = vm_stack_ptr_save(&th->ec, bptr);
 	    if (num > len) {
-		*bptr = rb_ary_new();
+		*vm_stack_ptr_restore(&th->ec, saved_bptr) = rb_ary_new();
 	    }
 	    else {
-		*bptr = rb_ary_new4(len - num, ptr + num);
+		*vm_stack_ptr_restore(&th->ec, saved_bptr) = rb_ary_new4(len - num, ptr + num);
 	    }
 	}
     }
@@ -1648,7 +1881,9 @@ vm_call_iseq_setup(rb_thread_t *th, rb_control_frame_t *cfp, struct rb_calling_i
     const rb_iseq_t *iseq = def_iseq_ptr(cc->me->def);
     const int param_size = iseq->body->param.size;
     const int local_size = iseq->body->local_table_size;
-    const int opt_pc = vm_callee_setup_arg(th, calling, ci, cc, def_iseq_ptr(cc->me->def), cfp->sp - calling->argc, param_size, local_size);
+    const int opt_pc = vm_callee_setup_arg(th, calling, ci, cc, def_iseq_ptr(cc->me->def),
+					   cfp->sp - calling->argc,
+					   param_size, local_size);
     return vm_call_iseq_setup_2(th, cfp, calling, ci, cc, opt_pc, param_size, local_size);
 }
 
@@ -1687,11 +1922,12 @@ vm_call_iseq_setup_tailcall(rb_thread_t *th, rb_control_frame_t *cfp, struct rb_
 			    int opt_pc)
 {
     unsigned int i;
-    VALUE *argv = cfp->sp - calling->argc;
+    rb_stack_index_t saved_argv = vm_stack_ptr_save(&th->ec, cfp->sp - calling->argc);
+    rb_stack_index_t saved_sp;
     const rb_callable_method_entry_t *me = cc->me;
     const rb_iseq_t *iseq = def_iseq_ptr(me->def);
-    VALUE *src_argv = argv;
-    VALUE *sp_orig, *sp;
+    VALUE *src_argv;
+    VALUE *sp;
     VALUE finish_flag = VM_FRAME_FINISHED_P(cfp) ? VM_FRAME_FLAG_FINISH : 0;
 
     if (VM_BH_FROM_CFP_P(calling->block_handler, cfp)) {
@@ -1709,12 +1945,14 @@ vm_call_iseq_setup_tailcall(rb_thread_t *th, rb_control_frame_t *cfp, struct rb_
     vm_pop_frame(th, cfp, cfp->ep);
     cfp = th->ec.cfp;
 
-    sp_orig = sp = cfp->sp;
+    sp = cfp->sp;
+    saved_sp = vm_stack_ptr_save(&th->ec, sp);
 
     /* push self */
     sp[0] = calling->recv;
     sp++;
 
+    src_argv = vm_stack_ptr_restore(&th->ec, saved_argv);
     /* copy arguments */
     for (i=0; i < iseq->body->param.size; i++) {
 	*sp++ = src_argv[i];
@@ -1726,7 +1964,7 @@ vm_call_iseq_setup_tailcall(rb_thread_t *th, rb_control_frame_t *cfp, struct rb_
 		  iseq->body->local_table_size - iseq->body->param.size,
 		  iseq->body->stack_max);
 
-    cfp->sp = sp_orig;
+    cfp->sp = vm_stack_ptr_restore(&th->ec, saved_sp);
     RUBY_VM_CHECK_INTS(th);
 
     return Qundef;
@@ -1873,7 +2111,7 @@ static inline int
 vm_cfp_consistent_p(rb_thread_t *th, const rb_control_frame_t *reg_cfp)
 {
     const int ov_flags = RAISED_STACKOVERFLOW;
-    if (LIKELY(reg_cfp == th->ec.cfp + 1)) return TRUE;
+    if (LIKELY(reg_cfp == RUBY_VM_PREVIOUS_CONTROL_FRAME(th->ec.cfp))) return TRUE;
     if (rb_thread_raised_p(th, ov_flags)) {
 	rb_thread_raised_reset(th, ov_flags);
 	return TRUE;
@@ -1883,7 +2121,7 @@ vm_cfp_consistent_p(rb_thread_t *th, const rb_control_frame_t *reg_cfp)
 
 #define CHECK_CFP_CONSISTENCY(func) \
     (LIKELY(vm_cfp_consistent_p(th, reg_cfp)) ? (void)0 : \
-     rb_bug(func ": cfp consistency error (%p, %p)", reg_cfp, th->ec.cfp+1))
+     (rb_bug(func ": cfp consistency error (%p, %p)", reg_cfp, RUBY_VM_PREVIOUS_CONTROL_FRAME(th->ec.cfp))))
 
 static inline
 const rb_method_cfunc_t *
@@ -1924,6 +2162,7 @@ vm_call_cfunc_with_frame(rb_thread_t *th, rb_control_frame_t *reg_cfp, struct rb
     VALUE recv = calling->recv;
     VALUE block_handler = calling->block_handler;
     int argc = calling->argc;
+    VALUE *argv;
 
     RUBY_DTRACE_CMETHOD_ENTRY_HOOK(th, me->owner, me->def->original_id);
     EXEC_EVENT_HOOK(th, RUBY_EVENT_C_CALL, recv, me->def->original_id, ci->mid, me->owner, Qundef);
@@ -1936,7 +2175,9 @@ vm_call_cfunc_with_frame(rb_thread_t *th, rb_control_frame_t *reg_cfp, struct rb
 
     reg_cfp->sp -= argc + 1;
     VM_PROFILE_UP(R2C_CALL);
-    val = (*cfunc->invoker)(cfunc->func, recv, argc, reg_cfp->sp + 1);
+    argv = ALLOCA_N(VALUE, argc);
+    MEMCPY(argv, reg_cfp->sp + 1, VALUE, argc);
+    val = (*cfunc->invoker)(cfunc->func, recv, argc, argv);
 
     CHECK_CFP_CONSISTENCY("vm_call_cfunc");
 
@@ -2089,11 +2330,12 @@ vm_call_opt_call(rb_thread_t *th, rb_control_frame_t *cfp, struct rb_calling_inf
 static VALUE
 vm_call_method_missing(rb_thread_t *th, rb_control_frame_t *reg_cfp, struct rb_calling_info *calling, const struct rb_call_info *orig_ci, struct rb_call_cache *orig_cc)
 {
-    VALUE *argv = STACK_ADDR_FROM_TOP(calling->argc);
+    rb_stack_index_t saved_argv = vm_stack_ptr_save(&th->ec, STACK_ADDR_FROM_TOP(calling->argc));
     struct rb_call_info ci_entry;
     const struct rb_call_info *ci;
     struct rb_call_cache cc_entry, *cc;
     unsigned int argc;
+    VALUE *argv;
 
     CALLER_SETUP_ARG(reg_cfp, calling, orig_ci);
     argc = calling->argc+1;
@@ -2112,9 +2354,10 @@ vm_call_method_missing(rb_thread_t *th, rb_control_frame_t *reg_cfp, struct rb_c
     calling->argc = argc;
 
     /* shift arguments: m(a, b, c) #=> method_missing(:m, a, b, c) */
-    CHECK_VM_STACK_OVERFLOW(reg_cfp, 1);
+    CHECK_VM_STACK_OVERFLOW(&th->ec, reg_cfp, 1);
+    argv = vm_stack_ptr_restore(&th->ec, saved_argv);
     if (argc > 1) {
-	MEMMOVE(argv+1, argv, VALUE, argc-1);
+	MEMMOVE(argv + 1, argv, VALUE, argc-1);
     }
     argv[0] = ID2SYM(orig_ci->mid);
     INC_SP(1);
@@ -2160,7 +2403,7 @@ current_method_entry(rb_thread_t *th, rb_control_frame_t *cfp)
 
 	do {
 	    cfp = RUBY_VM_PREVIOUS_CONTROL_FRAME(cfp);
-	    if (RUBY_VM_CONTROL_FRAME_STACK_OVERFLOW_P(th, cfp)) {
+	    if (cfp == RUBY_VM_END_CONTROL_FRAME(th)) {
 		/* TODO: orphan block */
 		return top_cfp;
 	    }
@@ -2578,13 +2821,15 @@ vm_yield_with_symbol(rb_thread_t *th,  VALUE symbol, int argc, const VALUE *argv
 }
 
 static inline int
-vm_callee_setup_block_arg_arg0_splat(rb_control_frame_t *cfp, const rb_iseq_t *iseq, VALUE *argv, VALUE ary)
+vm_callee_setup_block_arg_arg0_splat(const rb_thread_t *th, rb_control_frame_t *cfp, const rb_iseq_t *iseq, VALUE *argv, VALUE ary)
 {
+    rb_stack_index_t saved_argv = vm_stack_ptr_save(&th->ec, argv);
     int i;
     long len = RARRAY_LEN(ary);
 
-    CHECK_VM_STACK_OVERFLOW(cfp, iseq->body->param.lead_num);
+    CHECK_VM_STACK_OVERFLOW(&GET_THREAD()->ec, cfp, iseq->body->param.lead_num);
 
+    argv = vm_stack_ptr_restore(&th->ec, saved_argv);
     for (i=0; i<len && i<iseq->body->param.lead_num; i++) {
 	argv[i] = RARRAY_AREF(ary, i);
     }
@@ -2593,21 +2838,29 @@ vm_callee_setup_block_arg_arg0_splat(rb_control_frame_t *cfp, const rb_iseq_t *i
 }
 
 static inline VALUE
-vm_callee_setup_block_arg_arg0_check(VALUE *argv)
+vm_callee_setup_block_arg_arg0_check(const rb_thread_t *th, VALUE *argv)
 {
     VALUE ary, arg0 = argv[0];
+#if VM_CHECK_MODE > 0
+    rb_stack_index_t saved_argv = vm_stack_ptr_save(&th->ec, argv);
+#endif
     ary = rb_check_array_type(arg0);
-#if 0
-    argv[0] = arg0;
-#else
+#if VM_CHECK_MODE > 0
+    argv = vm_stack_ptr_restore(&th->ec, saved_argv);
     VM_ASSERT(argv[0] == arg0);
 #endif
     return ary;
 }
 
 static int
-vm_callee_setup_block_arg(rb_thread_t *th, struct rb_calling_info *calling, const struct rb_call_info *ci, const rb_iseq_t *iseq, VALUE *argv, const enum arg_setup_type arg_setup_type)
+vm_callee_setup_block_arg(rb_thread_t *th,
+			  struct rb_calling_info *calling,
+			  const struct rb_call_info *ci,
+			  const rb_iseq_t *iseq, VALUE *argv,
+			  const enum arg_setup_type arg_setup_type)
 {
+    rb_stack_index_t save_argv = vm_stack_ptr_save(&th->ec, argv);
+    VM_ASSERT(VM_EC_PTR_IN_INTERNAL_STACK_P(&th->ec, argv));
     if (simple_iseq_p(iseq)) {
 	rb_control_frame_t *cfp = th->ec.cfp;
 	VALUE arg0;
@@ -2618,15 +2871,17 @@ vm_callee_setup_block_arg(rb_thread_t *th, struct rb_calling_info *calling, cons
 	    calling->argc == 1 &&
 	    iseq->body->param.flags.has_lead &&
 	    !iseq->body->param.flags.ambiguous_param0 &&
-	    !NIL_P(arg0 = vm_callee_setup_block_arg_arg0_check(argv))) {
-	    calling->argc = vm_callee_setup_block_arg_arg0_splat(cfp, iseq, argv, arg0);
+	    !NIL_P(arg0 = vm_callee_setup_block_arg_arg0_check(th, vm_stack_ptr_restore(&th->ec, save_argv)))) {
+	    calling->argc = vm_callee_setup_block_arg_arg0_splat(th, cfp, iseq,
+								 vm_stack_ptr_restore(&th->ec, save_argv), arg0);
 	}
 
 	if (calling->argc != iseq->body->param.lead_num) {
 	    if (arg_setup_type == arg_setup_block) {
 		if (calling->argc < iseq->body->param.lead_num) {
 		    int i;
-		    CHECK_VM_STACK_OVERFLOW(cfp, iseq->body->param.lead_num);
+		    CHECK_VM_STACK_OVERFLOW(&th->ec, cfp, iseq->body->param.lead_num);
+		    argv = vm_stack_ptr_restore(&th->ec, save_argv);
 		    for (i=calling->argc; i<iseq->body->param.lead_num; i++) argv[i] = Qnil;
 		    calling->argc = iseq->body->param.lead_num; /* fill rest parameters */
 		}
@@ -2671,9 +2926,12 @@ vm_invoke_iseq_block(rb_thread_t *th, rb_control_frame_t *reg_cfp,
 {
     const rb_iseq_t *iseq = rb_iseq_check(captured->code.iseq);
     const int arg_size = iseq->body->param.size;
-    VALUE * const rsp = GET_SP() - calling->argc;
-    int opt_pc = vm_callee_setup_block_arg(th, calling, ci, iseq, rsp, is_lambda ? arg_setup_method : arg_setup_block);
+    VALUE *rsp = GET_SP() - calling->argc;
+    rb_stack_index_t saved_rsp = vm_stack_ptr_save(&th->ec, rsp);
+    int opt_pc = vm_callee_setup_block_arg(th, calling, ci, iseq, rsp,
+					   is_lambda ? arg_setup_method : arg_setup_block);
 
+    rsp = vm_stack_ptr_restore(&th->ec, saved_rsp);
     SET_SP(rsp);
 
     vm_push_frame(th, iseq,
@@ -2693,10 +2951,13 @@ vm_invoke_symbol_block(rb_thread_t *th, rb_control_frame_t *reg_cfp,
 		       VALUE symbol)
 {
     VALUE val;
+    VALUE *argv;
     int argc;
     CALLER_SETUP_ARG(th->ec.cfp, calling, ci);
     argc = calling->argc;
-    val = vm_yield_with_symbol(th, symbol, argc, STACK_ADDR_FROM_TOP(argc), VM_BLOCK_HANDLER_NONE);
+    argv = ALLOCA_N(VALUE, argc);
+    MEMCPY(argv, STACK_ADDR_FROM_TOP(argc), VALUE, argc);
+    val = vm_yield_with_symbol(th, symbol, argc, argv, VM_BLOCK_HANDLER_NONE);
     POPN(argc);
     return val;
 }
@@ -2707,10 +2968,13 @@ vm_invoke_ifunc_block(rb_thread_t *th, rb_control_frame_t *reg_cfp,
 		      const struct rb_captured_block *captured)
 {
     VALUE val;
+    VALUE *argv;
     int argc;
     CALLER_SETUP_ARG(th->ec.cfp, calling, ci);
     argc = calling->argc;
-    val = vm_yield_with_cfunc(th, captured, captured->self, argc, STACK_ADDR_FROM_TOP(argc), VM_BLOCK_HANDLER_NONE);
+    argv = ALLOCA_N(VALUE, argc);
+    MEMCPY(argv, STACK_ADDR_FROM_TOP(argc), VALUE, argc);
+    val = vm_yield_with_cfunc(th, captured, captured->self, argc, argv, VM_BLOCK_HANDLER_NONE);
     POPN(argc); /* TODO: should put before C/yield? */
     return val;
 }

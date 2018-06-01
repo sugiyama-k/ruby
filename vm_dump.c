@@ -2,7 +2,7 @@
 
   vm_dump.c -
 
-  $Author$
+  $Author: kazu $
 
   Copyright (C) 2004-2007 Koichi Sasada
 
@@ -21,9 +21,11 @@
 
 #define MAX_POSBUF 128
 
-#define VM_CFP_CNT(th, cfp) \
-  ((rb_control_frame_t *)((th)->ec.vm_stack + (th)->ec.vm_stack_size) - \
-   (rb_control_frame_t *)(cfp))
+static inline size_t
+VM_CFP_CNT(const rb_thread_t *th, const rb_control_frame_t *cfp)
+{
+    return VM_FRAME_COUNT(th->ec.eocfp, cfp);
+}
 
 static void
 control_frame_dump(rb_thread_t *th, rb_control_frame_t *cfp)
@@ -111,8 +113,7 @@ control_frame_dump(rb_thread_t *th, rb_control_frame_t *cfp)
 	line = -1;
     }
 
-    fprintf(stderr, "c:%04"PRIdPTRDIFF" ",
-	    ((rb_control_frame_t *)(th->ec.vm_stack + th->ec.vm_stack_size) - cfp));
+    fprintf(stderr, "c:%04"PRIdPTRDIFF" ", VM_CFP_CNT(th, cfp));
     if (pc == -1) {
 	fprintf(stderr, "p:---- ");
     }
@@ -162,9 +163,9 @@ rb_vmdebug_stack_dump_raw(rb_thread_t *th, rb_control_frame_t *cfp)
 
     fprintf(stderr, "-- Control frame information "
 	    "-----------------------------------------------\n");
-    while ((void *)cfp < (void *)(th->ec.vm_stack + th->ec.vm_stack_size)) {
+    while (cfp && cfp != th->ec.eocfp) {
 	control_frame_dump(th, cfp);
-	cfp++;
+	cfp = RUBY_VM_PREVIOUS_CONTROL_FRAME(cfp);
     }
     fprintf(stderr, "\n");
 }
@@ -289,8 +290,8 @@ vm_stack_dump_each(rb_thread_t *th, rb_control_frame_t *cfp)
 	}
     }
     else if (VM_FRAME_FINISHED_P(cfp)) {
-	if ((th)->ec.vm_stack + (th)->ec.vm_stack_size > (VALUE *)(cfp + 1)) {
-	    vm_stack_dump_each(th, cfp + 1);
+	if ((VALUE *)th->ec.eocfp != (VALUE *)(RUBY_VM_PREVIOUS_CONTROL_FRAME(cfp))) {
+	    vm_stack_dump_each(th, RUBY_VM_PREVIOUS_CONTROL_FRAME(cfp));
 	}
 	else {
 	    /* SDR(); */
@@ -318,7 +319,7 @@ rb_vmdebug_debug_print_register(rb_thread_t *th)
 	ep = -1;
     }
 
-    cfpi = ((rb_control_frame_t *)(th->ec.vm_stack + th->ec.vm_stack_size)) - cfp;
+    cfpi = VM_CFP_CNT(th, cfp);
     fprintf(stderr, "  [PC] %04"PRIdPTRDIFF", [SP] %04"PRIdPTRDIFF", [EP] %04"PRIdPTRDIFF", [CFP] %04"PRIdPTRDIFF"\n",
 	    pc, (cfp->sp - th->ec.vm_stack), ep, cfpi);
 }

@@ -2,7 +2,7 @@
 
   cont.c -
 
-  $Author$
+  $Author: normal $
   created at: Thu May 23 09:03:43 2007
 
   Copyright (C) 2007 Koichi Sasada
@@ -82,9 +82,10 @@ enum context_type {
 
 struct cont_saved_vm_stack {
     VALUE *ptr;
+    rb_control_frame_t *cptr;
 #ifdef CAPTURE_JUST_VALID_VM_STACK
     size_t slen;  /* length of stack (head of th->ec.vm_stack) */
-    size_t clen;  /* length of control frames (tail of th->ec.vm_stack) */
+    size_t clen;  /* length of control frame list */
 #endif
 };
 
@@ -271,13 +272,19 @@ cont_mark(void *ptr)
     RUBY_MARK_LEAVE("cont");
 }
 
+void rb_vm_control_frame_list_release(rb_control_frame_t *cfp);
+void rb_thread_vm_stack_release(VALUE *stack, size_t size);
+
 static void
 cont_free(void *ptr)
 {
     rb_context_t *cont = ptr;
 
     RUBY_FREE_ENTER("cont");
-    RUBY_FREE_UNLESS_NULL(cont->saved_ec.vm_stack);
+    if (cont->saved_ec.vm_stack) {
+	rb_thread_vm_stack_release(cont->saved_ec.vm_stack, cont->saved_ec.vm_stack_size);
+	cont->saved_ec.vm_stack = NULL;
+    }
 #if FIBER_USE_NATIVE
     if (cont->type == CONTINUATION_CONTEXT) {
 	/* cont */
@@ -288,6 +295,13 @@ cont_free(void *ptr)
 	/* fiber */
 	const rb_fiber_t *fib = (rb_fiber_t*)cont;
 	const rb_thread_t *const th = GET_THREAD();
+
+	if (cont->saved_ec.eocfp != NULL) {
+	    rb_vm_control_frame_list_release(cont->saved_ec.eocfp);
+	    cont->saved_ec.eocfp = NULL;
+	    cont->saved_ec.cfp = NULL;
+	}
+
 #ifdef _WIN32
 	if (th && th->ec.fiber != fib && cont->type != ROOT_FIBER_CONTEXT) {
 	    /* don't delete root fiber handle */
@@ -319,6 +333,7 @@ cont_free(void *ptr)
     RUBY_FREE_UNLESS_NULL(cont->machine.register_stack);
 #endif
     RUBY_FREE_UNLESS_NULL(cont->saved_vm_stack.ptr);
+    RUBY_FREE_UNLESS_NULL(cont->saved_vm_stack.cptr);
 
     /* free rb_cont_t or rb_fiber_t */
     ruby_xfree(ptr);
@@ -359,9 +374,11 @@ fiber_verify(const rb_fiber_t *fib)
     switch (fib->status) {
       case FIBER_RESUMED:
 	VM_ASSERT(fib->cont.saved_ec.vm_stack == NULL);
+	VM_ASSERT(fib->cont.saved_ec.eocfp == NULL);
 	break;
       case FIBER_SUSPENDED:
 	VM_ASSERT(fib->cont.saved_ec.vm_stack != NULL);
+	VM_ASSERT(fib->cont.saved_ec.eocfp != NULL);
 	break;
       case FIBER_CREATED:
       case FIBER_TERMINATED:
@@ -491,6 +508,9 @@ cont_save_thread(rb_context_t *cont, rb_thread_t *th)
 
     /* save thread context */
     *sec = th->ec;
+    VM_ASSERT(sec->vm_stack_size > 0);
+    VM_ASSERT(sec->vm_stack_max_size > 0);
+    VM_ASSERT(sec->vm_stack_max_size >= sec->vm_stack_size);
 
     /* saved_thread->machine.stack_end should be NULL */
     /* because it may happen GC afterward */
@@ -527,6 +547,26 @@ cont_new(VALUE klass)
     return cont;
 }
 
+rb_control_frame_t *rb_vm_control_frame_list_allocate(size_t len);
+
+static void
+copy_control_frame_list(rb_control_frame_t *dst, const rb_control_frame_t *src, size_t len)
+{
+    rb_control_frame_t *prev, *next;
+    for (; len > 0; len--, dst = RUBY_VM_NEXT_CONTROL_FRAME(dst),
+			   src = RUBY_VM_NEXT_CONTROL_FRAME(src)) {
+	VM_ASSERT(dst != NULL);
+	VM_ASSERT(src != NULL);
+	prev = dst->prev;
+	next = dst->next;
+	*dst = *src;
+	dst->prev = prev;
+	dst->next = next;
+    }
+}
+
+void rb_vm_stack_extend(rb_execution_context_t *ec, rb_control_frame_t *cfp, VALUE *sp, size_t new_size);
+
 static VALUE
 cont_capture(volatile int *volatile stat)
 {
@@ -536,22 +576,32 @@ cont_capture(volatile int *volatile stat)
     rb_execution_context_t *ec = &th->ec;
 
     THREAD_MUST_BE_RUNNING(th);
+    VM_ASSERT(ec->vm_stack_size > 0);
+    VM_ASSERT(ec->vm_stack_max_size > 0);
+    VM_ASSERT(ec->vm_stack_max_size >= ec->vm_stack_size);
+    if (ec->vm_stack_size < ec->vm_stack_max_size && !ec->vm_stack_captured) {
+	rb_vm_stack_extend(ec, ec->cfp, ec->cfp->sp, ec->vm_stack_max_size);
+    }
+    ec->vm_stack_captured = 1;
     rb_vm_stack_to_heap(th);
     cont = cont_new(rb_cContinuation);
     contval = cont->self;
 
 #ifdef CAPTURE_JUST_VALID_VM_STACK
     cont->saved_vm_stack.slen = ec->cfp->sp - ec->vm_stack;
-    cont->saved_vm_stack.clen = ec->vm_stack + ec->vm_stack_size - (VALUE*)ec->cfp;
+    cont->saved_vm_stack.clen = VM_FRAME_COUNT(ec->eocfp, ec->cfp);
+    cont->saved_vm_stack.cptr = rb_vm_control_frame_list_allocate(cont->saved_vm_stack.clen);
     cont->saved_vm_stack.ptr = ALLOC_N(VALUE, cont->saved_vm_stack.slen + cont->saved_vm_stack.clen);
     MEMCPY(cont->saved_vm_stack.ptr, ec->vm_stack, VALUE, cont->saved_vm_stack.slen);
-    MEMCPY(cont->saved_vm_stack.ptr + cont->saved_vm_stack.slen,
-		(VALUE*)ec->cfp, VALUE, cont->saved_vm_stack.clen);
+    copy_control_frame_list(cont->saved_vm_stack.cptr, RUBY_VM_FIRST_CONTROL_FRAME(ec), cont->saved_vm_stack.clen);
 #else
     cont->saved_vm_stack.ptr = ALLOC_N(VALUE, ec->vm_stack_size);
     MEMCPY(cont->saved_vm_stack.ptr, ec->vm_stack, VALUE, ec->vm_stack_size);
+    cont->saved_vm_stack.cptr = rb_vm_control_frame_list_allocate(cont->saved_vm_stack.clen);
+    copy_control_frame_list(cont->saved_vm_stack.cptr, RUBY_VM_FIRST_CONTROL_FRAME(ec), cont->saved_vm_stack.clen);
 #endif
     cont->saved_ec.vm_stack = NULL;
+    cont->saved_ec.eocfp = NULL;
 
     cont_save_machine_stack(th, cont);
 
@@ -592,8 +642,10 @@ fiber_restore_thread(rb_thread_t *th, rb_fiber_t *fib)
 {
     th->ec = fib->cont.saved_ec;
     fib->cont.saved_ec.vm_stack = NULL;
+    fib->cont.saved_ec.eocfp = NULL;
 
     VM_ASSERT(th->ec.vm_stack != NULL);
+    VM_ASSERT(th->ec.eocfp != NULL);
 }
 
 static inline void
@@ -614,12 +666,20 @@ cont_restore_thread(rb_context_t *cont)
 	    th->ec.vm_stack_size = fib->cont.saved_ec.vm_stack_size;
 	    th->ec.vm_stack = fib->cont.saved_ec.vm_stack;
 	}
+	else if (fib) {
+	    th->ec.vm_stack_max_size = fib->cont.saved_ec.vm_stack_max_size;
+	}
+
+	if (fib && fib->cont.saved_ec.eocfp) {
+	    th->ec.eocfp = fib->cont.saved_ec.eocfp;
+	}
+
 #ifdef CAPTURE_JUST_VALID_VM_STACK
 	MEMCPY(th->ec.vm_stack, cont->saved_vm_stack.ptr, VALUE, cont->saved_vm_stack.slen);
-	MEMCPY(th->ec.vm_stack + sec->vm_stack_size - cont->saved_vm_stack.clen,
-	       cont->saved_vm_stack.ptr + cont->saved_vm_stack.slen, VALUE, cont->saved_vm_stack.clen);
+	copy_control_frame_list(RUBY_VM_FIRST_CONTROL_FRAME(&th->ec), cont->saved_vm_stack.cptr, cont->saved_vm_stack.clen);
 #else
 	MEMCPY(th->ec.vm_stack, cont->saved_vm_stack.ptr, VALUE, sec->vm_stack_size);
+	copy_control_frame_list(RUBY_VM_FIRST_CONTROL_FRAME(&th->ec), cont->saved_vm_stack.cptr, cont->saved_vm_stack.clen);
 #endif
 
 	/* other members of ec */
@@ -634,7 +694,12 @@ cont_restore_thread(rb_context_t *cont)
 	th->ec.errinfo = sec->errinfo;
 	th->ec.trace_arg = sec->trace_arg;
 
+	VM_ASSERT(th->ec.vm_stack_size > 0);
+	VM_ASSERT(th->ec.vm_stack_max_size > 0);
+	VM_ASSERT(th->ec.vm_stack_max_size >= th->ec.vm_stack_size);
+
 	VM_ASSERT(th->ec.vm_stack != NULL);
+	VM_ASSERT(th->ec.eocfp != NULL);
     }
     else {
 	/* fiber */
@@ -1252,6 +1317,11 @@ fiber_t_alloc(VALUE fibval)
 }
 
 rb_control_frame_t *
+rb_control_frame_alloc(void);
+
+VALUE *rb_thread_vm_stack_allocate(size_t size);
+
+rb_control_frame_t *
 rb_vm_push_frame(rb_execution_context_t *sec,
 		 const rb_iseq_t *iseq,
 		 VALUE type,
@@ -1274,12 +1344,24 @@ fiber_init(VALUE fibval, VALUE proc)
     /* initialize cont */
     cont->saved_vm_stack.ptr = NULL;
 
+    /* for gc */
     sec->vm_stack = NULL;
     sec->vm_stack_size = 0;
+    sec->vm_stack_max_size = 0;
+    sec->eocfp = NULL;
+    sec->cfp = NULL;
 
-    sec->vm_stack_size = cth->vm->default_params.fiber_vm_stack_size / sizeof(VALUE);
-    sec->vm_stack = ALLOC_N(VALUE, sec->vm_stack_size);
-    sec->cfp = (void *)(sec->vm_stack + sec->vm_stack_size);
+    sec->vm_stack_size = cth->vm->default_params.fiber_vm_stack_initial_size / sizeof(VALUE);
+    sec->vm_stack_max_size = cth->vm->default_params.fiber_vm_stack_size / sizeof(VALUE);
+#if VM_STACK_EXTEND_LINEAR
+    sec->vm_stack_step_size = cth->vm->default_params.fiber_vm_stack_initial_size / sizeof(VALUE);
+#endif
+    sec->vm_stack = rb_thread_vm_stack_allocate(sec->vm_stack_size);
+    sec->eocfp = rb_control_frame_alloc();
+    sec->eocfp->prev = NULL;
+    sec->eocfp->next = NULL;
+    sec->cfp = sec->eocfp;
+    sec->vm_stack_captured = 0;
 
     rb_vm_push_frame(sec,
 		     NULL,
@@ -1391,6 +1473,7 @@ fiber_current(void)
 	rb_fiber_t *fib = root_fiber_alloc(th);
 	/* Running thread object has stack management responsibility */
 	fib->cont.saved_ec.vm_stack = NULL;
+	fib->cont.saved_ec.eocfp = NULL;
     }
     return th->ec.fiber;
 }

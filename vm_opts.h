@@ -3,7 +3,7 @@
 
   vm_opts.h - VM optimize option
 
-  $Author$
+  $Author: nobu $
 
   Copyright (C) 2004-2007 Koichi Sasada
 
@@ -46,6 +46,8 @@
 #define OPT_INSTRUCTIONS_UNIFICATION 0
 #define OPT_UNIFY_ALL_COMBINATION    0
 #define OPT_STACK_CACHING            0
+
+#define VM_STACK_EXTEND_LINEAR       0
 
 /* misc */
 #define SUPPORT_JOKE                 0

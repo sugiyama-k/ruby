@@ -442,21 +442,22 @@ backtrace_each(rb_thread_t *th,
      *  current frame <- th->ec.cfp
      */
 
-    start_cfp =
-      RUBY_VM_NEXT_CONTROL_FRAME(
-	  RUBY_VM_NEXT_CONTROL_FRAME(start_cfp)); /* skip top frames */
+    /* skip top frames */
+    for (i = 1; i <= 2 && start_cfp; i++) {
+	start_cfp = RUBY_VM_NEXT_CONTROL_FRAME(start_cfp);
+    }
 
-    if (start_cfp < last_cfp) {
+    if (!start_cfp || start_cfp != last_cfp && VM_FRAME_LOWER_P(start_cfp, last_cfp)) {
 	size = 0;
     }
     else {
-	size = start_cfp - last_cfp + 1;
+	size = VM_FRAME_COUNT(start_cfp, last_cfp) + 1;
     }
 
     init(arg, size);
 
     /* SDR(); */
-    for (i=0, cfp = start_cfp; i<size; i++, cfp = RUBY_VM_NEXT_CONTROL_FRAME(cfp)) {
+    for (i=0, cfp = start_cfp; cfp && i<size; i++, cfp = RUBY_VM_NEXT_CONTROL_FRAME(cfp)) {
 	/* fprintf(stderr, "cfp: %d\n", (rb_control_frame_t *)(th->stack + th->stack_size) - cfp); */
 	if (cfp->iseq) {
 	    if (cfp->pc) {
@@ -1250,7 +1251,7 @@ rb_profile_frames(int start, int limit, VALUE *buff, int *lines)
     rb_control_frame_t *cfp = th->ec.cfp, *end_cfp = RUBY_VM_END_CONTROL_FRAME(th);
     const rb_callable_method_entry_t *cme;
 
-    for (i=0; i<limit && cfp != end_cfp;) {
+    for (i=0; i<limit && cfp && cfp != end_cfp;) {
 	if (cfp->iseq && cfp->pc) {
 	    if (start > 0) {
 		start--;

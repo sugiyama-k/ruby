@@ -2,7 +2,7 @@
 
   vm_core.h -
 
-  $Author$
+  $Author: ko1 $
   created at: 04/01/01 19:41:38 JST
 
   Copyright (C) 2004-2007 Koichi Sasada
@@ -576,8 +576,10 @@ typedef struct rb_vm_struct {
     /* params */
     struct { /* size in byte */
 	size_t thread_vm_stack_size;
+	size_t thread_vm_stack_initial_size;
 	size_t thread_machine_stack_size;
 	size_t fiber_vm_stack_size;
+	size_t fiber_vm_stack_initial_size;
 	size_t fiber_machine_stack_size;
     } default_params;
 
@@ -586,17 +588,39 @@ typedef struct rb_vm_struct {
 
 /* default values */
 
-#define RUBY_VM_SIZE_ALIGN 4096
+#define RUBY_VM_SIZE_ALIGN 128
 
-#define RUBY_VM_THREAD_VM_STACK_SIZE          ( 128 * 1024 * sizeof(VALUE)) /*  512 KB or 1024 KB */
-#define RUBY_VM_THREAD_VM_STACK_SIZE_MIN      (   2 * 1024 * sizeof(VALUE)) /*    8 KB or   16 KB */
-#define RUBY_VM_THREAD_MACHINE_STACK_SIZE     ( 128 * 1024 * sizeof(VALUE)) /*  512 KB or 1024 KB */
-#define RUBY_VM_THREAD_MACHINE_STACK_SIZE_MIN (  16 * 1024 * sizeof(VALUE)) /*   64 KB or  128 KB */
+#define RUBY_VM_THREAD_VM_STACK_SIZE             ( 128 * 1024 * sizeof(VALUE)) /*  512 KB or 1024 KB */
+#define RUBY_VM_THREAD_VM_STACK_SIZE_MIN         RUBY_VM_SIZE_ALIGN            /*               128B */
+#define RUBY_VM_THREAD_VM_STACK_INITIAL_SIZE     (   2 * 1024 * sizeof(VALUE)) /*    8 KB or   16 KB */
+#define RUBY_VM_THREAD_VM_STACK_INITIAL_SIZE_MIN RUBY_VM_SIZE_ALIGN            /*               128B */
+#define RUBY_VM_THREAD_MACHINE_STACK_SIZE        ( 128 * 1024 * sizeof(VALUE)) /*  512 KB or 1024 KB */
+#define RUBY_VM_THREAD_MACHINE_STACK_SIZE_MIN    (  16 * 1024 * sizeof(VALUE)) /*   64 KB or  128 KB */
 
-#define RUBY_VM_FIBER_VM_STACK_SIZE           (  16 * 1024 * sizeof(VALUE)) /*   64 KB or  128 KB */
-#define RUBY_VM_FIBER_VM_STACK_SIZE_MIN       (   2 * 1024 * sizeof(VALUE)) /*    8 KB or   16 KB */
-#define RUBY_VM_FIBER_MACHINE_STACK_SIZE      (  64 * 1024 * sizeof(VALUE)) /*  256 KB or  512 KB */
-#define RUBY_VM_FIBER_MACHINE_STACK_SIZE_MIN  (  16 * 1024 * sizeof(VALUE)) /*   64 KB or  128 KB */
+#define RUBY_VM_FIBER_VM_STACK_SIZE              (  16 * 1024 * sizeof(VALUE)) /*   64 KB or  128 KB */
+#define RUBY_VM_FIBER_VM_STACK_SIZE_MIN          RUBY_VM_SIZE_ALIGN            /*               128B */
+#define RUBY_VM_FIBER_VM_STACK_INITIAL_SIZE      (   2 * 1024 * sizeof(VALUE)) /*    8 KB or   16 KB */
+#define RUBY_VM_FIBER_VM_STACK_INITIAL_SIZE_MIN  RUBY_VM_SIZE_ALIGN            /*               128B */
+#define RUBY_VM_FIBER_MACHINE_STACK_SIZE         (  64 * 1024 * sizeof(VALUE)) /*  256 KB or  512 KB */
+#define RUBY_VM_FIBER_MACHINE_STACK_SIZE_MIN     (  16 * 1024 * sizeof(VALUE)) /*   64 KB or  128 KB */
+
+#ifndef VM_STACK_EXTEND_LINEAR
+#define VM_STACK_EXTEND_LINEAR 0
+#endif
+
+#if VM_STACK_EXTEND_LINEAR
+#define VM_STACK_EXTEND_COEF 1
+#else
+#define VM_STACK_EXTEND_BASE 2
+#endif
+
+#ifndef VM_STACK_USE_MPROTECT
+#define VM_STACK_USE_MPROTECT 0
+#endif
+
+#ifndef VM_STACK_STRESS
+#define VM_STACK_STRESS 0
+#endif
 
 /* optimize insn */
 #define INTEGER_REDEFINED_OP_FLAG (1 << 0)
@@ -666,7 +690,22 @@ typedef struct rb_control_frame_struct {
 #if VM_DEBUG_BP_CHECK
     VALUE *bp_check;		/* cfp[6] */
 #endif
+    struct rb_control_frame_struct *prev;
+    struct rb_control_frame_struct *next;
 } rb_control_frame_t;
+
+struct rb_vm_args_info {
+    /* basic args info */
+    VALUE *locals;
+    VALUE *argv;
+    int argc;
+    const struct rb_call_info_kw_arg *kw_arg;
+
+    /* additional args info */
+    int rest_index;
+    VALUE *kw_argv;
+    VALUE rest;
+};
 
 extern const rb_data_type_t ruby_threadptr_data_type;
 
@@ -737,7 +776,15 @@ typedef struct rb_execution_context_struct {
     /* execution information */
     VALUE *vm_stack;		/* must free, must mark */
     size_t vm_stack_size;       /* size in word (byte size / sizeof(VALUE)) */
+    size_t vm_stack_max_size;
+#if VM_STACK_EXTEND_LINEAR
+    size_t vm_stack_step_size;
+#endif
     rb_control_frame_t *cfp;
+    rb_control_frame_t *eocfp;
+    int vm_stack_captured;
+
+    struct rb_vm_args_info args_info;
 
     struct rb_vm_tag *tag;
     struct rb_vm_protect_tag *protect_tag;
@@ -1234,14 +1281,48 @@ void rb_vm_block_copy(VALUE obj, const struct rb_block *dst, const struct rb_blo
 
 VALUE rb_vm_frame_block_handler(const rb_control_frame_t *cfp);
 
-#define RUBY_VM_PREVIOUS_CONTROL_FRAME(cfp) ((cfp)+1)
-#define RUBY_VM_NEXT_CONTROL_FRAME(cfp) ((cfp)-1)
-#define RUBY_VM_END_CONTROL_FRAME(th) \
-  ((rb_control_frame_t *)((th)->ec.vm_stack + (th)->ec.vm_stack_size))
+#define RUBY_VM_PREVIOUS_CONTROL_FRAME(cfp) ((cfp)->prev)
+#define RUBY_VM_NEXT_CONTROL_FRAME(cfp) ((cfp)->next)
+#define RUBY_VM_END_CONTROL_FRAME(th) ((th)->ec.eocfp)
+#define RUBY_VM_FIRST_CONTROL_FRAME(ec) (VM_ASSERT((ec)->eocfp),RUBY_VM_NEXT_CONTROL_FRAME((ec)->eocfp))
+
+/* not used */
 #define RUBY_VM_VALID_CONTROL_FRAME_P(cfp, ecfp) \
-  ((void *)(ecfp) > (void *)(cfp))
+  ((cfp) && VM_FRAME_LOWER_P(cfp, (ecfp)->next))
 #define RUBY_VM_CONTROL_FRAME_STACK_OVERFLOW_P(th, cfp) \
   (!RUBY_VM_VALID_CONTROL_FRAME_P((cfp), RUBY_VM_END_CONTROL_FRAME(th)))
+
+static inline int
+VM_FRAME_LOWER_P(const rb_control_frame_t *cfp1, const rb_control_frame_t *cfp2)
+{
+    /* cfp1 <= cfp2 ? */
+    for (; cfp1; cfp1 = RUBY_VM_PREVIOUS_CONTROL_FRAME(cfp1)) {
+	if (cfp1 == cfp2) {
+	    return 1;
+	}
+    }
+    return 0;
+}
+
+static inline int
+VM_FRAME_HIGHER_P(const rb_control_frame_t *cfp1, const rb_control_frame_t *cfp2)
+{
+    /* cfp1 >= cfp2 ? */
+    for (; cfp2; cfp2 = RUBY_VM_PREVIOUS_CONTROL_FRAME(cfp2)) {
+	if (cfp2 == cfp1) {
+	    return 1;
+	}
+    }
+    return 0;
+}
+
+static inline size_t
+VM_FRAME_COUNT(const rb_control_frame_t *root, const rb_control_frame_t *cfp)
+{
+    int i = 0;
+    for (; cfp && cfp != root; i++, cfp = RUBY_VM_PREVIOUS_CONTROL_FRAME(cfp));
+    return i;
+}
 
 static inline int
 VM_BH_ISEQ_BLOCK_P(VALUE block_handler)
@@ -1329,6 +1410,48 @@ vm_block_handler_type(VALUE block_handler)
 	VM_ASSERT(rb_obj_is_proc(block_handler));
 	return block_handler_type_proc;
     }
+}
+
+static inline int
+VM_PTR_IN_INTERNAL_STACK_P(const VALUE *stack_base, const VALUE *stack_end, const void *ptr)
+{
+    return ptr >= (void *)stack_base && ptr < (void *)stack_end ? 1 : 0;
+}
+
+static inline int
+VM_PTR_IN_CALL_STACK_P(const rb_control_frame_t *cfp, const rb_control_frame_t *eocfp, const void *ptr)
+{
+    VM_ASSERT(cfp);
+    VM_ASSERT(eocfp);
+    for (; cfp != eocfp; cfp = RUBY_VM_PREVIOUS_CONTROL_FRAME(cfp)) {
+	if (ptr >= (void *)cfp && ptr < (void *)(cfp + 1)) {
+	    return 1;
+	}
+    }
+    return 0;
+}
+
+#define VM_EC_PTR_IN_INTERNAL_STACK_P(ec, ptr) \
+    VM_PTR_IN_INTERNAL_STACK_P((ec)->vm_stack, (ec)->vm_stack + (ec)->vm_stack_size, (VALUE *)(ptr))
+
+#define VM_EC_PTR_IN_CALL_STACK_P(ec, ptr) \
+    VM_PTR_IN_CALL_STACK_P((ec)->cfp, (ec)->eocfp, (VALUE *)(ptr))
+
+typedef ptrdiff_t rb_stack_index_t;
+
+static inline VALUE *
+vm_stack_ptr_restore(const rb_execution_context_t *ec, ptrdiff_t saved_ptr)
+{
+    VM_ASSERT(saved_ptr >= 0);
+    VM_ASSERT((size_t)saved_ptr <= ec->vm_stack_size);
+    return ec->vm_stack + saved_ptr;
+}
+
+static inline ptrdiff_t
+vm_stack_ptr_save(const rb_execution_context_t *ec, const VALUE *ptr)
+{
+    VM_ASSERT(VM_EC_PTR_IN_INTERNAL_STACK_P(ec, ptr));
+    return ptr - ec->vm_stack;
 }
 
 static inline void
@@ -1553,16 +1676,20 @@ const rb_callable_method_entry_t *rb_vm_frame_method_entry(const rb_control_fram
 #define sysstack_error GET_VM()->special_exceptions[ruby_error_sysstack]
 
 #define RUBY_CONST_ASSERT(expr) (1/!!(expr)) /* expr must be a compile-time constant */
-#define VM_STACK_OVERFLOWED_P(cfp, sp, margin) \
+#define VM_STACK_OVERFLOWED_P(ec, cfp, sp, margin) \
     (!RUBY_CONST_ASSERT(sizeof(*(sp)) == sizeof(VALUE)) || \
-     !RUBY_CONST_ASSERT(sizeof(*(cfp)) == sizeof(rb_control_frame_t)) || \
-     ((rb_control_frame_t *)((sp) + (margin)) + 1) >= (cfp))
-#define WHEN_VM_STACK_OVERFLOWED(cfp, sp, margin) \
-    if (LIKELY(!VM_STACK_OVERFLOWED_P(cfp, sp, margin))) {(void)0;} else /* overflowed */
-#define CHECK_VM_STACK_OVERFLOW0(cfp, sp, margin) \
-    WHEN_VM_STACK_OVERFLOWED(cfp, sp, margin) vm_stackoverflow()
-#define CHECK_VM_STACK_OVERFLOW(cfp, margin) \
-    WHEN_VM_STACK_OVERFLOWED(cfp, (cfp)->sp, margin) vm_stackoverflow()
+     ((rb_control_frame_t *)((sp) + (margin)) + 1) >= (rb_control_frame_t *)((ec)->vm_stack + (ec)->vm_stack_size))
+#if VM_STACK_STRESS
+#define WHEN_VM_STACK_OVERFLOWED(ec, cfp, sp, margin) \
+    if (0) {(void)0;} else /* overflowed */
+#else
+#define WHEN_VM_STACK_OVERFLOWED(ec, cfp, sp, margin) \
+    if (LIKELY(!VM_STACK_OVERFLOWED_P(ec, cfp, sp, margin))) {(void)0;} else /* overflowed */
+#endif
+#define CHECK_VM_STACK_OVERFLOW0(ec, cfp, sp, margin) \
+    WHEN_VM_STACK_OVERFLOWED(ec, cfp, sp, margin) vm_stack_try_extend(ec, cfp, sp, margin)
+#define CHECK_VM_STACK_OVERFLOW(ec, cfp, margin) \
+    WHEN_VM_STACK_OVERFLOWED(ec, cfp, (cfp)->sp, margin) vm_stack_try_extend(ec, cfp, (cfp)->sp, margin)
 
 VALUE rb_catch_protect(VALUE t, rb_block_call_func *func, VALUE data, enum ruby_tag_type *stateptr);
 

@@ -2,7 +2,7 @@
 
   thread.c -
 
-  $Author$
+  $Author: hsbt $
 
   Copyright (C) 2004-2007 Koichi Sasada
 
@@ -595,6 +595,9 @@ thread_do_start(rb_thread_t *th, VALUE args)
     }
 }
 
+void rb_thread_vm_stack_release(VALUE *stack, size_t size);
+void rb_vm_control_frame_list_release(rb_control_frame_t *cfp);
+
 static int
 thread_start_func_2(rb_thread_t *th, VALUE *stack_start, VALUE *register_stack_start)
 {
@@ -696,8 +699,12 @@ thread_start_func_2(rb_thread_t *th, VALUE *stack_start, VALUE *register_stack_s
 	rb_threadptr_unlock_all_locking_mutexes(th);
 	rb_check_deadlock(th->vm);
 
-	rb_thread_recycle_stack_release(th->ec.vm_stack);
+	rb_thread_vm_stack_release(th->ec.vm_stack, th->ec.vm_stack_size);
+	rb_vm_control_frame_list_release(th->ec.eocfp);
+	th->ec.eocfp = NULL;
 	th->ec.vm_stack = NULL;
+	th->ec.vm_stack_size = 0;
+	th->ec.vm_stack_max_size = 0;
     }
     native_mutex_lock(&th->vm->thread_destruct_lock);
     /* make sure vm->running_thread never point me after this point.*/
